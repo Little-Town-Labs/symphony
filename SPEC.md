@@ -550,318 +550,337 @@ Dispatch gating behavior:
 - `template_render_error` and `empty_prompt_template` fail only the affected run.
 - A run already in flight MUST NOT be invalidated by a registry change; the resolved contract is frozen on the run.
 
-## 6. Configuration Specification
+## 6. Harness Configuration Specification
 
 ### 6.1 Configuration Resolution Pipeline
 
-Configuration is resolved in this order:
+Harness configuration is operational, not policy. Policy lives in the agent contract, prompt, and rubric registries (§5); this section covers the runtime knobs the harness itself reads to operate Inngest functions, gateway calls, and audit persistence.
 
-1. Select the workflow file path (explicit runtime setting, otherwise cwd default).
-2. Parse YAML front matter into a raw config map.
-3. Apply built-in defaults for missing OPTIONAL fields.
-4. Resolve `$VAR_NAME` indirection only for config values that explicitly contain `$VAR_NAME`.
-5. Coerce and validate typed values.
+Resolution order:
 
-Environment variables do not globally override YAML values. They are used only when a config value
-explicitly references them.
+1. Read built-in harness defaults.
+2. Layer environment-variable overrides for fields that name explicit env variables.
+3. Layer deployment-config overrides (Vercel environment, Inngest project config, deployment manifest). Implementation-defined which transport carries deployment overrides; the layering order is normative.
+4. Coerce and validate typed values at process start.
+
+Environment variables do not globally override deployment config; both layers apply only to fields that explicitly opt in.
 
 Value coercion semantics:
 
-- Path/command fields support:
-  - `~` home expansion
-  - `$VAR` expansion for env-backed path values
-  - Apply expansion only to values intended to be local filesystem paths; do not rewrite URIs or
-    arbitrary shell command strings.
-- Relative `workspace.root` values resolve relative to the directory containing the selected
-  `WORKFLOW.md`.
+- Endpoint URLs MUST be absolute and validated against an allow-list of expected hosts (gateway endpoints, Inngest endpoints) at startup.
+- Signing-key references MUST resolve to a key handle in the configured key store. Inline key material is rejected at validation.
+- Numeric fields with a unit (ms, tokens) MUST validate range; out-of-range values fail startup.
 
-### 6.2 Dynamic Reload Semantics
+### 6.2 Reload Semantics
 
-Dynamic reload is REQUIRED:
+Harness config is process-scoped and changes on deployment, not at runtime. There is no `WORKFLOW.md`-style hot-reload. The motivation is auditability: a run dispatched under one harness config MUST complete under that config, and the dossier records the harness version producing it.
 
-- The software MUST detect `WORKFLOW.md` changes.
-- On change, it MUST re-read and re-apply workflow config and prompt template without restart.
-- The software MUST attempt to adjust live behavior to the new config (for example polling
-  cadence, concurrency limits, active/terminal states, codex settings, workspace paths/hooks, and
-  prompt content for future runs).
-- Reloaded config applies to future dispatch, retry scheduling, reconciliation decisions, hook
-  execution, and agent launches.
-- Implementations are not REQUIRED to restart in-flight agent sessions automatically when config
-  changes.
-- Extensions that manage their own listeners/resources (for example an HTTP server port change) MAY
-  require restart unless the implementation explicitly supports live rebind.
-- Implementations SHOULD also re-validate/reload defensively during runtime operations (for example
-  before dispatch) in case filesystem watch events are missed.
-- Invalid reloads MUST NOT crash the service; keep operating with the last known good effective
-  configuration and emit an operator-visible error.
+Required behavior:
+
+- All harness-config values are frozen at process start.
+- Mid-run config changes are not supported. Mid-run mutation of a frozen value is a `harness_config_mutation_error`.
+- Deployment-time config changes take effect on subsequent process starts. In-flight runs continue under their original harness version until completion.
+- The harness MUST emit a `harness_config_loaded` audit entry at startup with a content-addressed hash of the resolved config.
+
+This is a deliberate departure from Symphony, which supports dynamic workflow reload. In Symphony, the `WORKFLOW.md` is the policy artifact and operators want fast iteration; in JobBobber the policy artifact is the versioned contract registry, which already supports rapid iteration without touching harness config.
 
 ### 6.3 Dispatch Preflight Validation
 
-This validation is a scheduler preflight run before attempting to dispatch new work. It validates
-the workflow/config needed to poll and launch workers, not a full audit of all possible workflow
-behavior.
+Validation runs at process start AND at every run dispatch. The startup check covers harness-wide concerns; the per-dispatch check covers run-specific resolution that depends on the registries.
 
 Startup validation:
 
-- Validate configuration before starting the scheduling loop.
-- If startup validation fails, fail startup and emit an operator-visible error.
+- All REQUIRED fields are present and well-typed.
+- Gateway endpoints reachable (HTTP HEAD or equivalent liveness probe).
+- Inngest signing key resolves and signature round-trips.
+- Audit log persistence reachable and write-capable.
+- Dossier signing key (if signing is enabled) resolves to a usable handle.
+- Failure: process MUST refuse to start and emit an operator-visible error.
 
-Per-tick dispatch validation:
+Per-dispatch validation:
 
-- Re-validate before each dispatch cycle.
-- If validation fails, skip dispatch for that tick, keep reconciliation active, and emit an
-  operator-visible error.
-
-Validation checks:
-
-- Workflow file can be loaded and parsed.
-- `tracker.kind` is present and supported.
-- `tracker.api_key` is present after `$` resolution.
-- `tracker.project_slug` is present when REQUIRED by the selected tracker kind.
-- `codex.command` is present and non-empty.
+- Both sides' contract refs resolve in the contract registry.
+- Both sides' rubric refs resolve and (in production posture) carry bias-test artifacts.
+- Privacy ruleset ref resolves.
+- Concurrency slots available under both global and per-side caps.
+- Failure: dispatch is rejected with a structured error; the match-ticket state remains unchanged so a later dispatch can succeed once the registry issue is resolved.
 
 ### 6.4 Core Config Fields Summary (Cheat Sheet)
 
-This section is intentionally redundant so a coding agent can implement the config layer quickly.
-Extension fields are documented in the extension section that defines them. Core conformance does
-not require recognizing or validating extension fields unless that extension is implemented.
+Implementation-defined which transport carries each value (env, deployment manifest, secrets manager). The logical schema is normative.
 
-- `tracker.kind`: string, REQUIRED, currently `linear`
-- `tracker.endpoint`: string, default `https://api.linear.app/graphql` when `tracker.kind=linear`
-- `tracker.api_key`: string or `$VAR`, canonical env `LINEAR_API_KEY` when `tracker.kind=linear`
-- `tracker.project_slug`: string, REQUIRED when `tracker.kind=linear`
-- `tracker.active_states`: list of strings, default `["Todo", "In Progress"]`
-- `tracker.terminal_states`: list of strings, default `["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]`
-- `polling.interval_ms`: integer, default `30000`
-- `workspace.root`: path resolved to absolute, default `<system-temp>/symphony_workspaces`
-- `hooks.after_create`: shell script or null
-- `hooks.before_run`: shell script or null
-- `hooks.after_run`: shell script or null
-- `hooks.before_remove`: shell script or null
-- `hooks.timeout_ms`: integer, default `60000`
-- `agent.max_concurrent_agents`: integer, default `10`
-- `agent.max_turns`: integer, default `20`
-- `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
-- `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
-- `codex.command`: shell command string, default `codex app-server`
-- `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
-- `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
-- `codex.turn_sandbox_policy`: Codex `SandboxPolicy` value, default implementation-defined
-- `codex.turn_timeout_ms`: integer, default `3600000`
-- `codex.read_timeout_ms`: integer, default `5000`
-- `codex.stall_timeout_ms`: integer, default `300000`
+Operational:
 
-## 7. Orchestration State Machine
+- `harness.version`: string, REQUIRED. Content-addressed identifier (e.g. git SHA) recorded on every dossier and audit entry.
+- `harness.environment`: string, enum `production` | `staging` | `development`. Production posture enforces bias-test-required and dossier signing.
 
-The orchestrator is the only component that mutates scheduling state. All worker outcomes are
-reported back to it and converted into explicit state transitions.
+Concurrency and bounds:
 
-### 7.1 Issue Orchestration States
+- `runs.max_concurrent`: integer, default `25`. Global Inngest concurrency cap on negotiation runs.
+- `runs.max_concurrent_per_principal`: integer, default `5`. Cap on concurrent runs the same principal's agent participates in.
+- `runs.default_round_cap`: integer, default `3`. Used when neither contract pins a `round_cap_contribution` lower than this value.
+- `runtime_ceilings.turn_timeout_ms_max`: integer, default `120000`.
+- `runtime_ceilings.total_run_timeout_ms_max`: integer, default `1800000` (30m).
+- `runtime_ceilings.max_tokens_per_turn_max`: integer, default `8000`.
+- `runtime_ceilings.max_total_tokens_max`: integer, default `64000`.
+- `runtime_ceilings.tool_calls_per_turn_cap_max`: integer, default `8`.
 
-This is not the same as tracker states (`Todo`, `In Progress`, etc.). This is the service's internal
-claim state.
+Gateway and models:
 
-1. `Unclaimed`
-   - Issue is not running and has no retry scheduled.
+- `gateway.endpoint`: URL, REQUIRED. Vercel AI Gateway base URL.
+- `gateway.api_key_ref`: secret-store key handle, REQUIRED.
+- `gateway.fallback_policy`: enum `none` | `on_provider_error` | `on_any_error`, default `on_provider_error`.
 
-2. `Claimed`
-   - Orchestrator has reserved the issue to prevent duplicate dispatch.
-   - In practice, claimed issues are either `Running` or `RetryQueued`.
+Audit and persistence:
 
-3. `Running`
-   - Worker task exists and the issue is tracked in `running` map.
+- `audit.retention_class`: enum `compliance_long` | `compliance_standard` | `internal`, default `compliance_long` in production. Drives storage tier and retention duration; specific durations are policy artifacts referenced from the registry, not hard-coded here.
+- `audit.hash_chain_enabled`: boolean, default `true` in production.
+- `audit.partition_strategy`: enum `global` | `per_run` | `per_day`, default `per_day`.
 
-4. `RetryQueued`
-   - Worker is not running, but a retry timer exists in `retry_attempts`.
+Dossier:
 
-5. `Released`
-   - Claim removed because issue is terminal, non-active, missing, or retry path completed without
-     re-dispatch.
+- `dossier.signing_enabled`: boolean, default `true` in production.
+- `dossier.signing_key_ref`: secret-store key handle, REQUIRED when signing is enabled.
+- `dossier.signing_algorithm`: enum, default implementation-defined (RECOMMENDED: HMAC-SHA-256 or Ed25519).
 
-Important nuance:
+Privacy:
 
-- A successful worker exit does not mean the issue is done forever.
-- The worker MAY continue through multiple back-to-back coding-agent turns before it exits.
-- After each normal turn completion, the worker re-checks the tracker issue state.
-- If the issue is still in an active state, the worker SHOULD start another turn on the same live
-  coding-agent thread in the same workspace, up to `agent.max_turns`.
-- The first turn SHOULD use the full rendered task prompt.
-- Continuation turns SHOULD send only continuation guidance to the existing thread, not resend the
-  original task prompt that is already present in thread history.
-- Once the worker exits normally, the orchestrator still schedules a short continuation retry
-  (about 1 second) so it can re-check whether the issue remains active and needs another worker
-  session.
+- `privacy.ruleset_cache_ttl_ms`: integer, default `60000`. Bound on how long a resolved ruleset version may be cached in-process.
+- `privacy.untrusted_input_max_chars`: integer, default `100000`. Per-field cap before truncation; over-cap inputs MUST surface as `untrusted_input_truncated` to the agent and the audit log.
 
-### 7.2 Run Attempt Lifecycle
+Inngest:
 
-A run attempt transitions through these phases:
+- `inngest.app_id`: string, REQUIRED.
+- `inngest.signing_key_ref`: secret-store key handle, REQUIRED.
+- `inngest.event_key_ref`: secret-store key handle, REQUIRED.
 
-1. `PreparingWorkspace`
-2. `BuildingPrompt`
-3. `LaunchingAgentProcess`
-4. `InitializingSession`
-5. `StreamingTurn`
-6. `Finishing`
-7. `Succeeded`
-8. `Failed`
-9. `TimedOut`
-10. `Stalled`
-11. `CanceledByReconciliation`
+## 7. Negotiation Run-State Machine
 
-Distinct terminal reasons are important because retry logic and logs differ.
+The negotiation coordinator (§3.1) is the only component that mutates run state. All side-runner outcomes, tool results, and timer events are reported back to it and converted into explicit state transitions. Durability is provided by Inngest's step-function model; the coordinator's state is reconstructible from the audit log and the match ticket.
+
+### 7.1 Run Lifecycle States
+
+A negotiation run progresses through the following states. Names are normalized lowercase per §4.2.
+
+Active states:
+
+1. `pending`
+   - Run dispatched (Inngest event accepted) but not yet started. Contracts and rulesets are being resolved.
+
+2. `seeker_turn`
+   - Seeker-side agent is generating its turn output.
+
+3. `seeker_filtering`
+   - Seeker output is crossing the privacy filter on its way to the employer's context.
+
+4. `employer_turn`
+   - Employer-side agent is generating its turn output.
+
+5. `employer_filtering`
+   - Employer output is crossing the privacy filter on its way to the seeker's context.
+
+6. `round_complete`
+   - Both sides have spoken in the current round. The coordinator decides whether to advance the round counter and start another round, or proceed to scoring.
+
+7. `scoring`
+   - Both side agents are producing their final per-dimension rubric scores. This is a structured tool-mediated phase, not free-form negotiation.
+
+8. `producing_dossier`
+   - The dossier producer is assembling the canonical dossier from both sides' scored output, the audit transcript, and the version metadata.
+
+Terminal states:
+
+9. `complete`
+   - Dossier produced with `outcome=complete`. Both sides scored fully.
+
+10. `inconclusive`
+    - Dossier produced with `outcome=inconclusive`. At least one flag explains what would resolve the run; no run paused mid-flight to ask.
+
+11. `aborted`
+    - Run terminated because the underlying match ticket transitioned to a state that invalidates the run (e.g. either side's principal withdrew their ticket). No dossier produced; an audit entry records the abort.
+
+12. `timed_out`
+    - Run exceeded `total_run_timeout_ms` for either side. The dossier producer attempts a best-effort `inconclusive` dossier; if even that fails, the run terminates as `timed_out` with an audit entry only.
+
+13. `tool_failure`
+    - Tool failure beyond retry budget that prevents either side from completing. Like `timed_out`, MAY still produce an `inconclusive` dossier; the terminal state is recorded for operator triage.
+
+### 7.2 Round Sequencing Discipline
+
+- Each round consists of one seeker turn followed by one employer turn. Strict alternation; the seeker speaks first by convention. A future contract option MAY allow the employer to lead, but this version pins seeker-first.
+- The round counter increments on transition from `employer_filtering` to either `round_complete` (advance) or `scoring` (cap reached or both agents emitted a `done` signal during their turn).
+- Either side MAY emit a `done` signal as part of its turn output, indicating it has nothing further to negotiate. When both sides have signaled `done` in the same round, the coordinator transitions to `scoring` after `employer_filtering`. A unilateral `done` from one side does not skip the other side's turn in the current round.
+- The round cap (`round_cap`) is the minimum of the two contracts' `round_cap_contribution` values, bounded above by `runs.default_round_cap` from §6.4. When the coordinator reaches `round_cap` after `employer_filtering`, transition is to `scoring`, regardless of `done` signals.
 
 ### 7.3 Transition Triggers
 
-- `Poll Tick`
-  - Reconcile active runs.
-  - Validate config.
-  - Fetch candidate issues.
-  - Dispatch until slots are exhausted.
+- `inngest_event:negotiation.dispatch.requested`
+  - `→ pending`. Resolve contracts and rulesets; emit `harness_event:contracts_resolved` to audit.
 
-- `Worker Exit (normal)`
-  - Remove running entry.
-  - Update aggregate runtime totals.
-  - Schedule continuation retry (attempt `1`) after the worker exhausts or finishes its in-process
-    turn loop.
+- `inngest_event:contracts_resolved`
+  - `pending → seeker_turn`. First seeker turn dispatched.
 
-- `Worker Exit (abnormal)`
-  - Remove running entry.
-  - Update aggregate runtime totals.
-  - Schedule exponential-backoff retry.
+- `side_runner_event:turn_completed (side=seeker)`
+  - `seeker_turn → seeker_filtering`. Hand turn output to the privacy filter.
 
-- `Codex Update Event`
-  - Update live session fields, token counters, and rate limits.
+- `privacy_filter_event:projection_complete (direction=seeker_to_employer)`
+  - `seeker_filtering → employer_turn`.
 
-- `Retry Timer Fired`
-  - Re-fetch active candidates and attempt re-dispatch, or release claim if no longer eligible.
+- `side_runner_event:turn_completed (side=employer)`
+  - `employer_turn → employer_filtering`.
 
-- `Reconciliation State Refresh`
-  - Stop runs whose issue states are terminal or no longer active.
+- `privacy_filter_event:projection_complete (direction=employer_to_seeker)`
+  - `employer_filtering → round_complete` (if more rounds available and not both `done`) OR `→ scoring` (if cap reached or both `done`).
 
-- `Stall Timeout`
-  - Kill worker and schedule retry.
+- `coordinator_decision:advance_round`
+  - `round_complete → seeker_turn`. Round counter incremented.
+
+- `coordinator_decision:proceed_to_scoring`
+  - `round_complete → scoring`.
+
+- `side_runner_event:scoring_complete (both sides)`
+  - `scoring → producing_dossier`.
+
+- `dossier_producer_event:dossier_persisted`
+  - `producing_dossier → complete` (if `outcome=complete`) OR `→ inconclusive`.
+
+- `match_ticket_event:invalidating_state_change`
+  - any non-terminal `→ aborted`. Coordinator MUST stop pending side-runner turns; in-flight tool calls MAY complete but their results are NOT persisted to the run context.
+
+- `timer_event:total_run_timeout`
+  - any non-terminal `→ timed_out`. Coordinator attempts best-effort `inconclusive` dossier production before emitting the terminal audit entry.
+
+- `tool_failure_event:beyond_retry`
+  - any non-terminal `→ tool_failure`. Same best-effort dossier path as `timed_out`.
 
 ### 7.4 Idempotency and Recovery Rules
 
-- The orchestrator serializes state mutations through one authority to avoid duplicate dispatch.
-- `claimed` and `running` checks are REQUIRED before launching any worker.
-- Reconciliation runs before dispatch on every tick.
-- Restart recovery is tracker-driven and filesystem-driven (without a durable orchestrator DB).
-- Startup terminal cleanup removes stale workspaces for issues already in terminal states.
+- The negotiation coordinator runs as an Inngest step-function; durable state is the Inngest run record plus the audit log entries. The coordinator MUST NOT depend on in-process memory for correctness across step boundaries.
+- Each Inngest step MUST be idempotent. The coordinator achieves this by keying state mutations on `(run_id, round, side, step_kind)` so a re-executed step produces the same audit entry rather than a duplicate.
+- Match-ticket state mutations (round counter, dossier reference, terminal status) MUST be performed via conditional writes scoped by `run_id`. A coordinator restart that finds the match ticket already advanced past its expected position MUST treat the run as recovered, not re-dispatch.
+- A run that started under harness version A and is recovered after a deploy to harness version B MUST continue under harness version A. The harness emits a `harness_version_drift` audit warning if the recovering version differs from the dispatched version, but the run's frozen contracts and recorded harness version remain authoritative.
+- There is no "retry the run" semantic at the run level. Failure modes either produce an `inconclusive` dossier or terminate as `timed_out`/`tool_failure`. Re-negotiation is a separate run with a new `run_id` (§4.1.4) triggered by an explicit `match_ticket.renegotiation_requested` event.
 
-## 8. Polling, Scheduling, and Reconciliation
+## 8. Event Dispatch and Inngest Topology
 
-### 8.1 Poll Loop
+JobBobber's harness is event-driven, not polling-based. Inngest is the durable executor; this section defines the events, the functions that consume them, the concurrency and idempotency rules, and the recovery semantics. Symphony's polling loop, candidate selection, and reconciliation tick are replaced by event-triggered Inngest functions.
 
-At startup, the service validates config, performs startup cleanup, schedules an immediate tick, and
-then repeats every `polling.interval_ms`.
+### 8.1 Event Topology
 
-The effective poll interval SHOULD be updated when workflow config changes are re-applied.
+Events flow through Inngest. Each event name uses the dotted convention `domain.entity.action`. The harness MUST validate event payloads against versioned schemas; unknown event versions MUST be rejected.
 
-Tick sequence:
+Inbound events (consumed by harness functions):
 
-1. Reconcile running issues.
-2. Run dispatch preflight validation.
-3. Fetch candidate issues from tracker using active states.
-4. Sort issues by dispatch priority.
-5. Dispatch eligible issues while slots remain.
-6. Notify observability/status consumers of state changes.
+- `match_ticket.match_made` — emitted by the matchmaking subsystem when a seeker ticket and an employer ticket are paired. Payload includes `match_ticket_id`, `seeker_contract_ref`, `employer_contract_ref`, `privacy_ruleset_ref`.
+- `match_ticket.renegotiation_requested` — emitted when a human or downstream consumer requests a re-negotiation of an existing match ticket. Payload includes `match_ticket_id` and OPTIONAL contract-version overrides.
+- `match_ticket.invalidating_state_change` — emitted by the principal-side ticket store when a ticket transitions to a state that invalidates any in-flight runs (e.g. principal withdrew). Payload includes `match_ticket_id` and `reason`.
 
-If per-tick validation fails, dispatch is skipped for that tick, but reconciliation still happens
-first.
+Internal events (emitted by harness functions, consumed by other harness functions):
 
-### 8.2 Candidate Selection Rules
+- `negotiation.dispatch.requested` — fan-out point from the dispatcher to the coordinator.
+- `negotiation.turn.requested` — coordinator → side runner. Payload is `(run_id, side, round)`.
+- `negotiation.turn.completed` — side runner → coordinator. Payload includes turn output and `done` signal status.
+- `negotiation.filter.requested` — coordinator → privacy filter. Payload is the cross-side projection job.
+- `negotiation.filter.completed` — privacy filter → coordinator.
+- `negotiation.scoring.requested` — coordinator → both side runners (parallel).
+- `negotiation.scoring.completed` — side runner → coordinator. Per-side; coordinator awaits both before advancing.
+- `negotiation.dossier.requested` — coordinator → dossier producer.
 
-An issue is dispatch-eligible only if all are true:
+Outbound events (emitted by harness, consumed by downstream subsystems):
 
-- It has `id`, `identifier`, `title`, and `state`.
-- Its state is in `active_states` and not in `terminal_states`.
-- It is not already in `running`.
-- It is not already in `claimed`.
-- Global concurrency slots are available.
-- Per-state concurrency slots are available.
-- Blocker rule for `Todo` state passes:
-  - If the issue state is `Todo`, do not dispatch when any blocker is non-terminal.
+- `dossier.produced` — emitted on terminal `complete` or `inconclusive` transitions. Payload is the dossier reference. Downstream consumers (notification service, ATS webhook emitter, A2A receiver) subscribe to this event; the harness MUST NOT know about specific consumers.
+- `negotiation.run.terminated` — emitted on every terminal transition (including `aborted`, `timed_out`, `tool_failure`). Payload includes `run_id`, terminal state, and dossier reference if any.
 
-Sorting order (stable intent):
+### 8.2 Inngest Functions
 
-1. `priority` ascending (1..4 are preferred; null/unknown sorts last)
-2. `created_at` oldest first
-3. `identifier` lexicographic tie-breaker
+Each function is durable, retryable, and individually concurrency-controlled. Step boundaries within a function MUST align with audit-log entries (§13).
+
+1. `dispatcher`
+   - Triggered by `match_ticket.match_made` and `match_ticket.renegotiation_requested`.
+   - Resolves contracts, rulesets, and concurrency slots (preflight validation §6.3).
+   - On success, emits `negotiation.dispatch.requested` and writes the initial run record. On preflight failure, emits a `negotiation.run.terminated` event without state mutation on the match ticket beyond an audit entry.
+
+2. `coordinator`
+   - Triggered by `negotiation.dispatch.requested`. Owns one negotiation run end-to-end.
+   - Drives the run-state machine (§7) by emitting `negotiation.turn.requested`, `negotiation.filter.requested`, `negotiation.scoring.requested`, `negotiation.dossier.requested` to subordinate functions and consuming their `*.completed` events via Inngest's `step.waitForEvent`.
+   - Implementation MUST use Inngest step functions; the coordinator is the authoritative driver of run state and MUST NOT delegate state-machine transitions to subordinate functions.
+
+3. `side_runner_seeker` and `side_runner_employer`
+   - Two distinct Inngest functions, one per side. The split is deliberate: it lets concurrency keys, model selection, and gateway quotas be tuned independently per side, and it makes the audit log unambiguous about which agent executed.
+   - Triggered by `negotiation.turn.requested` and `negotiation.scoring.requested` events filtered by `side`.
+   - Each runner composes the prompt, drives the model session, dispatches contract-allowed tools, and emits the corresponding `*.completed` event.
+
+4. `privacy_filter`
+   - Triggered by `negotiation.filter.requested`.
+   - Applies the resolved privacy ruleset deterministically. Emits `negotiation.filter.completed` with the redacted projection.
+   - MUST run as a separate function (not inlined in the coordinator) so its decisions are independently auditable and replayable from the audit log.
+
+5. `dossier_producer`
+   - Triggered by `negotiation.dossier.requested`.
+   - Assembles the dossier, computes deterministic weighted totals, signs (if enabled), persists, and emits `dossier.produced` and `negotiation.run.terminated`.
+
+6. `run_invalidator`
+   - Triggered by `match_ticket.invalidating_state_change`.
+   - Cancels in-flight runs for the affected match ticket by emitting an internal cancellation signal that the coordinator's `step.waitForEvent` honors (Inngest's cancellation primitive). Emits `negotiation.run.terminated` with terminal state `aborted` after the coordinator confirms.
 
 ### 8.3 Concurrency Control
 
-Global limit:
+Each Inngest function declares concurrency keys against the harness config (§6.4):
 
-- `available_slots = max(max_concurrent_agents - running_count, 0)`
+- `coordinator`: keyed on `match_ticket_id` with limit `1` (one in-flight run per match ticket); global limit `runs.max_concurrent`.
+- `dispatcher`: keyed on `match_ticket_id` with limit `1` to dedupe duplicate dispatch events.
+- `side_runner_seeker` / `side_runner_employer`: keyed on `(run_id, side)` with limit `1`; global limits per side derived from gateway quota.
+- `privacy_filter`: keyed on `run_id` with limit `1` (filter operations within one run are serialized to keep the audit log linear).
+- `dossier_producer`: keyed on `run_id` with limit `1`.
 
-Per-state limit:
+Per-principal cap:
 
-- `max_concurrent_agents_by_state[state]` if present (state key normalized)
-- otherwise fallback to global limit
-
-The runtime counts issues by their current tracked state in the `running` map.
+- The harness MUST enforce `runs.max_concurrent_per_principal`. Implementation MAY use Inngest concurrency keys derived from the principal IDs reachable via the match ticket, OR an explicit pre-dispatch check in `dispatcher` against an in-process counter. The cap MUST hold under restart by being recomputed from the audit log when the dispatcher cannot read its prior state.
 
 ### 8.4 Retry and Backoff
 
-Retry entry creation:
+The harness does NOT implement run-level retry. Failure-mode disposition is governed by §7's terminal states; re-negotiation is an explicit caller-initiated event.
 
-- Cancel any existing retry timer for the same issue.
-- Store `attempt`, `identifier`, `error`, `due_at_ms`, and new timer handle.
+Inngest function-level retries DO apply:
 
-Backoff formula:
+- Each function step MAY retry on transient failure. Inngest's default exponential backoff applies; the harness MAY override per function.
+- Retried steps MUST be idempotent. Idempotency keys are `(run_id, function_step_name, deterministic_input_hash)` for each step's audit entry.
+- A step that exhausts its retry budget produces the appropriate failure event:
+  - Side runner: `tool_failure_event:beyond_retry` or model gateway exhausted → coordinator transitions to `tool_failure` per §7.3.
+  - Privacy filter: filter exhaustion is treated as `tool_failure` with a flag of kind `privacy_filter_unavailable`.
+  - Dossier producer: best-effort retry; if the dossier cannot be produced, the run terminates with the appropriate §7 terminal state and an audit entry records the failure.
 
-- Normal continuation retries after a clean worker exit use a short fixed delay of `1000` ms.
-- Failure-driven retries use `delay = min(10000 * 2^(attempt - 1), agent.max_retry_backoff_ms)`.
-- Power is capped by the configured max retry backoff (default `300000` / 5m).
+Step-level retry budgets:
 
-Retry handling behavior:
+- `gateway_call_max_retries`: integer, default `3`.
+- `tool_call_max_retries`: integer, default `2`.
+- `audit_write_max_retries`: integer, default `5`. Audit failures MUST NOT be silently dropped; if even the retry budget exhausts, the run terminates with `tool_failure` and an operator-visible alert is raised.
 
-1. Fetch active candidate issues (not all issues).
-2. Find the specific issue by `issue_id`.
-3. If not found, release claim.
-4. If found and still candidate-eligible:
-   - Dispatch if slots are available.
-   - Otherwise requeue with error `no available orchestrator slots`.
-5. If found but no longer active, release claim.
+### 8.5 Run Reconciliation
 
-Note:
+Inngest provides durable execution; a process restart resumes runs from their last persisted step. The harness adds three reconciliation responsibilities on top:
 
-- Terminal-state workspace cleanup is handled by startup cleanup and active-run reconciliation
-  (including terminal transitions for currently running issues).
-- Retry handling mainly operates on active candidates and releases claims when the issue is absent,
-  rather than performing terminal cleanup itself.
+Reconciliation runs at coordinator step boundaries (not on a tick):
 
-### 8.5 Active Run Reconciliation
+A. **Match-ticket invalidation reconciliation.**
+   - Before each step, the coordinator MUST re-read the match ticket's `state` field. If the state indicates an invalidating change occurred since the prior step, the coordinator transitions to `aborted` per §7.3.
+   - This is an additional check beyond the `match_ticket.invalidating_state_change` event because event delivery and step execution are not perfectly serialized.
 
-Reconciliation runs every tick and has two parts.
+B. **Stall detection.**
+   - Each function step has its own timeout via Inngest. Stall detection at the harness level applies only to the coordinator's `step.waitForEvent` calls awaiting subordinate function completion. The wait MUST have an explicit timeout derived from the relevant runtime ceiling (§6.4); on timeout the coordinator emits the appropriate failure event.
 
-Part A: Stall detection
+C. **Audit-log replay validation.**
+   - On any coordinator restart of an in-flight run, the coordinator MUST replay the run's audit-log entries to validate that no entry was written ahead of the recovered Inngest step position. A divergence indicates a serious harness bug and MUST surface as `audit_step_divergence` and abort the run with `tool_failure` rather than continuing.
 
-- For each running issue, compute `elapsed_ms` since:
-  - `last_codex_timestamp` if any event has been seen, else
-  - `started_at`
-- If `elapsed_ms > codex.stall_timeout_ms`, terminate the worker and queue a retry.
-- If `stall_timeout_ms <= 0`, skip stall detection entirely.
+### 8.6 Startup Reconciliation
 
-Part B: Tracker state refresh
+On harness process start:
 
-- Fetch current issue states for all running issue IDs.
-- For each running issue:
-  - If tracker state is terminal: terminate worker and clean workspace.
-  - If tracker state is still active: update the in-memory issue snapshot.
-  - If tracker state is neither active nor terminal: terminate worker without workspace cleanup.
-- If state refresh fails, keep workers running and try again on the next tick.
+1. Emit `harness_config_loaded` audit entry (§6.2).
+2. Query the audit log for runs that have a terminal state but no `dossier.produced` event emitted (the producer crashed after persisting the dossier but before emitting the event). Re-emit `dossier.produced` for each.
+3. Query for in-flight runs whose Inngest run records have been orphaned (e.g. Inngest deleted them per its retention). Mark each as `tool_failure` with reason `orphaned_inflight_run` and emit terminal events.
 
-### 8.6 Startup Terminal Workspace Cleanup
-
-When the service starts:
-
-1. Query tracker for issues in terminal states.
-2. For each returned issue identifier, remove the corresponding workspace directory.
-3. If the terminal-issues fetch fails, log a warning and continue startup.
-
-This prevents stale terminal workspaces from accumulating after restarts.
+There is no per-match-ticket workspace to clean up: the harness owns no filesystem state beyond the audit log and the contract/rubric registries, all of which are externally durable.
 
 ## 9. Workspace Management and Safety
 
