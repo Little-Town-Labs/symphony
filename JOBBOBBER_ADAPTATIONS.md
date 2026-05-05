@@ -164,7 +164,7 @@ This matters for evolving the agent layer over time without breaking active matc
 
 ## Pinning
 
-This doc is written against Symphony at commit `b0e0ff0082236a73c12a48483d0c6036fdd31fe1` (initial public release). OpenAI has stated they don't plan to maintain Symphony as a product, so we're not tracking upstream. If there's a major Symphony update worth re-evaluating, that's a fresh research task, not a continuous integration burden.
+This doc is written against Symphony at commit `58cf97d` (`fix(elixir): configure Codex app-server model via config`) — the last upstream commit before this fork, and the version of `SPEC.md` physically present in this repo. The patterns discussed here originated in Symphony's initial public release (`b0e0ff0`) and are unchanged through `58cf97d`; the later commit only refines spec prose (RFC 2119 normative language, tightened "may" vs "MUST" wording) without altering the pattern set. OpenAI has stated they don't plan to maintain Symphony as a product, so we're not tracking upstream. If there's a major Symphony update worth re-evaluating, that's a fresh research task, not a continuous integration burden.
 
 ---
 

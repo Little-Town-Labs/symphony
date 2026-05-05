@@ -2,7 +2,7 @@
 
 This repository is a fork of [openai/symphony](https://github.com/openai/symphony), adapted into the working specification for the **JobBobber agent harness**. It is a spec-and-docs repo: there is no runtime here, no service to deploy, and no code dependency to install. The deliverable is the spec itself.
 
-The fork is pinned to upstream commit [`b0e0ff0`](https://github.com/openai/symphony/commit/b0e0ff0082236a73c12a48483d0c6036fdd31fe1) (Symphony's initial public release). We are not tracking upstream — Symphony's value to us is the harness *pattern*, captured once at this commit and adapted from there. OpenAI has stated they don't plan to maintain Symphony as a product, so re-evaluation against any future upstream change is a fresh research task rather than a continuous integration burden.
+The fork is pinned to upstream commit [`58cf97d`](https://github.com/openai/symphony/commit/58cf97d) (`fix(elixir): configure Codex app-server model via config`) — the last upstream commit before this fork. We are not tracking upstream — Symphony's value to us is the harness *pattern*, captured once at this commit and adapted from there. OpenAI has stated they don't plan to maintain Symphony as a product, so re-evaluation against any future upstream change is a fresh research task rather than a continuous integration burden.
 
 ## What we kept and why
 
@@ -25,7 +25,7 @@ The harness specified in this repo is what wraps each negotiation run. It define
 
 ## Attribution
 
-Originally forked from [openai/symphony](https://github.com/openai/symphony), pinned to commit [`b0e0ff0`](https://github.com/openai/symphony/commit/b0e0ff0082236a73c12a48483d0c6036fdd31fe1) (initial public release). Symphony is © 2025 OpenAI, licensed under Apache 2.0. The original `LICENSE` and `NOTICE` files are preserved in this repository unchanged.
+Originally forked from [openai/symphony](https://github.com/openai/symphony), pinned to commit [`58cf97d`](https://github.com/openai/symphony/commit/58cf97d). Symphony is © 2025 OpenAI, licensed under Apache 2.0. The original `LICENSE` and `NOTICE` files are preserved in this repository unchanged.
 
 For background on the harness pattern this spec builds on, see OpenAI's [harness engineering post](https://openai.com/index/harness-engineering/) and the [Symphony announcement](https://openai.com/index/open-source-codex-orchestration-symphony/).
 
