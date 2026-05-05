@@ -393,213 +393,162 @@ Fields:
 - `Normalized Match State`
   - Compare states after `lowercase`. Run-state machine values defined in §7 are already lowercase.
 
-## 5. Workflow Specification (Repository Contract)
+## 5. Agent Contract Specification (Versioned Policy)
 
-### 5.1 File Discovery and Path Resolution
+The agent contract is the JobBobber harness's analog of Symphony's `WORKFLOW.md`. It is the versioned, structured definition of one side's agent behavior for one run: prompt template, scoring rubric reference, tool surface, model selection, runtime settings. Two contracts (one seeker, one employer) are loaded per run and frozen for the run's duration.
 
-Workflow file path precedence:
+This section defines the contract storage, identification, validation, and rendering rules. The actual content of any specific contract version (the dimension list of a rubric, the body of a prompt template) is product/policy artifact, not part of this specification.
 
-1. Explicit application/runtime setting (set by CLI startup path).
-2. Default: `WORKFLOW.md` in the current process working directory.
+### 5.1 Contract Storage and Identification
 
-Loader behavior:
+Contracts are stored in a versioned registry. The harness MUST resolve a `(contract_id, version)` pair to one immutable definition for all time.
 
-- If the file cannot be read, return `missing_workflow_file` error.
-- The workflow file is expected to be repository-owned and version-controlled.
+Storage requirements:
 
-### 5.2 File Format
+- The registry MUST be durable across deployments. The match ticket records `(contract_id, version)` references; those references MUST resolve indefinitely under the audit retention schedule (§13).
+- Implementations MAY use a database table, a Git repository pinned to specific commits, a content-addressed object store, or a combination. The implementation choice is implementation-defined; the immutability discipline is not.
+- Each contract version MUST carry an authorship and review provenance record. AI-hiring regulation requires human accountability for the policy artifacts the harness applies; the registry is where that lineage is recorded.
+- Renaming or mutating an existing version is a `contract_version_mutation_error` and MUST be rejected by the registry. Producing a new version is the only permitted mode of change.
 
-`WORKFLOW.md` is a Markdown file with OPTIONAL YAML front matter.
+Resolution behavior:
 
-Design note:
+- Loaders MUST treat a missing `(contract_id, version)` reference as `missing_contract` error and refuse to dispatch the run.
+- Loaders MAY cache resolved contracts in-process; cache TTL is bounded by the harness config (§6) and MUST NOT outlive a deployment without explicit invalidation.
 
-- `WORKFLOW.md` SHOULD be self-contained enough to describe and run different workflows (prompt,
-  runtime settings, hooks, and tracker selection/config) without requiring out-of-band
-  service-specific configuration.
+### 5.2 Contract Format
 
-Parsing rules:
+A contract is a structured object with the following top-level fields. The on-disk or in-database representation is implementation-defined (TypeScript module export, JSON document, etc.); the logical schema is normative.
 
-- If file starts with `---`, parse lines until the next `---` as YAML front matter.
-- Remaining lines become the prompt body.
-- If front matter is absent, treat the entire file as prompt body and use an empty config map.
-- YAML front matter MUST decode to a map/object; non-map YAML is an error.
-- Prompt body is trimmed before use.
+Required fields:
 
-Returned workflow object:
+- `contract_id` (string)
+- `version` (string, immutable per §5.1)
+- `side` (string, enum: `seeker` | `employer`)
+- `prompt_template_ref` (object: `{template_id, version}`)
+- `rubric_ref` (object: `{rubric_id, version}`)
+- `tool_surface` (list of tool descriptors; see §5.5)
+- `model` (object: `{provider, model_id, fallback}`)
+- `runtime_settings` (object; see §5.6)
+- `round_cap_contribution` (positive integer)
+- `created_at` (timestamp)
+- `created_by` (object: `{principal_id, review_refs}`)
 
-- `config`: front matter root object (not nested under a `config` key).
-- `prompt_template`: trimmed Markdown body.
+Optional fields:
 
-### 5.3 Front Matter Schema
+- `description` (string) — human-readable summary of what this contract version changes versus prior versions.
+- `deprecated_after` (timestamp or null) — registries SHOULD refuse to dispatch new runs with deprecated contracts; existing runs in flight MUST complete on the contract version they were dispatched with.
 
-Top-level keys:
+Forward compatibility:
 
-- `tracker`
-- `polling`
-- `workspace`
-- `hooks`
-- `agent`
-- `codex`
+- Unknown top-level fields SHOULD be ignored by older harness versions to allow gradual rollout of new contract features.
+- Extensions to the contract schema MUST document their field schema, defaults, validation rules, and whether they affect dossier audit.
 
-Unknown keys SHOULD be ignored for forward compatibility.
+### 5.3 Prompt Template Reference
 
-Note:
+The prompt body itself lives in a separate prompt registry, referenced by `(template_id, version)`. The contract pins the version; the registry resolves it to a body.
 
-- The workflow front matter is extensible. Extensions MAY define additional top-level keys without
-  changing the core schema above.
-- Extensions SHOULD document their field schema, defaults, validation rules, and whether changes
-  apply dynamically or require restart.
+Registry requirements:
 
-#### 5.3.1 `tracker` (object)
+- Same immutability discipline as the contract registry (§5.1).
+- Templates MUST NOT embed the rubric content; the rubric is a separate artifact (§5.4) so it can be versioned, bias-tested, and audited independently. Templates MAY reference rubric dimension names if the renderer is wired to inject them, but dimension scoring guidance and weights MUST NOT appear in the template body.
+- Templates SHOULD be self-contained: changes to platform-wide guardrails (untrusted-input handling, run-to-completion discipline, dossier production) live in harness code, not in every template.
 
-Fields:
+### 5.4 Rubric Reference
 
-- `kind` (string)
-  - REQUIRED for dispatch.
-  - Current supported value: `linear`
-- `endpoint` (string)
-  - Default for `tracker.kind == "linear"`: `https://api.linear.app/graphql`
-- `api_key` (string)
-  - MAY be a literal token or `$VAR_NAME`.
-  - Canonical environment variable for `tracker.kind == "linear"`: `LINEAR_API_KEY`.
-  - If `$VAR_NAME` resolves to an empty string, treat the key as missing.
-- `project_slug` (string)
-  - REQUIRED for dispatch when `tracker.kind == "linear"`.
-- `active_states` (list of strings)
-  - Default: `Todo`, `In Progress`
-- `terminal_states` (list of strings)
-  - Default: `Closed`, `Cancelled`, `Canceled`, `Duplicate`, `Done`
+The contract references a versioned rubric (§4.1.6). The contract MUST NOT embed rubric content; rubrics are independent versioned artifacts so:
 
-#### 5.3.2 `polling` (object)
+- A rubric can be bias-tested once and reused across many contract versions.
+- A prompt-only refinement can ship without invalidating prior bias-test artifacts.
+- Audit reconstruction can reason about prompt drift and rubric drift separately.
 
-Fields:
+Rubric registry requirements:
 
-- `interval_ms` (integer)
-  - Default: `30000`
-  - Changes SHOULD be re-applied at runtime and affect future tick scheduling without restart.
+- Each rubric version MUST carry a `bias_test_ref` (§4.1.6). Dispatch with a rubric version that has no bias-test artifact MUST be rejected as `rubric_missing_bias_test` unless the harness is explicitly running in a non-production posture documented per §15.
+- Dimension weights MUST sum to a finite, non-zero total. The harness MUST verify this at contract load time, not at dossier production time.
+- The aggregation function MUST be one of the deterministic options the harness implements (default: `weighted_mean`). The harness MUST compute the aggregate; the model MUST NOT be asked for a holistic score.
 
-#### 5.3.3 `workspace` (object)
+### 5.5 Tool Surface Specification
 
-Fields:
+The contract's `tool_surface` lists every tool the agent MAY invoke during the run.
 
-- `root` (path string or `$VAR`)
-  - Default: `<system-temp>/symphony_workspaces`
-  - `~` is expanded.
-  - Relative paths are resolved relative to the directory containing `WORKFLOW.md`.
-  - The effective workspace root is normalized to an absolute path before use.
+Each tool descriptor:
 
-#### 5.3.4 `hooks` (object)
+- `name` (string) — stable tool identifier in the harness's tool catalog.
+- `version` (string) — the version of the tool's input/output schema this contract was designed against.
+- `input_schema` (object) — the JSON Schema (or equivalent) the harness validates inputs against before dispatching the tool.
+- `output_schema` (object) — the JSON Schema describing what the tool returns; outputs that fail validation MUST be surfaced as `tool_output_invalid` to the agent rather than passed through unchecked.
+- `disclosure_class` (string, enum: `principal_self` | `counterparty_filtered` | `platform_open`) — what privacy posture the tool's outputs require. `counterparty_filtered` outputs MUST pass through the privacy filter (§3.1) before reaching the agent's context, even when the agent invoking the tool is the principal's own side.
 
-Fields:
+Tool invocation semantics, advertised vs. unsupported tool calls, and graceful failure rules are defined in §10 (Agent Runner Protocol). This section defines only the contract-side declaration.
 
-- `after_create` (multiline shell script string, OPTIONAL)
-  - Runs only when a workspace directory is newly created.
-  - Failure aborts workspace creation.
-- `before_run` (multiline shell script string, OPTIONAL)
-  - Runs before each agent attempt after workspace preparation and before launching the coding
-    agent.
-  - Failure aborts the current attempt.
-- `after_run` (multiline shell script string, OPTIONAL)
-  - Runs after each agent attempt (success, failure, timeout, or cancellation) once the workspace
-    exists.
-  - Failure is logged but ignored.
-- `before_remove` (multiline shell script string, OPTIONAL)
-  - Runs before workspace deletion if the directory exists.
-  - Failure is logged but ignored; cleanup still proceeds.
-- `timeout_ms` (integer, OPTIONAL)
-  - Default: `60000`
-  - Applies to all workspace hooks.
-  - Invalid values fail configuration validation.
-  - Changes SHOULD be re-applied at runtime for future hook executions.
+Forward compatibility:
 
-#### 5.3.5 `agent` (object)
+- New tools MAY be added to the catalog without breaking older active runs; runs only see tools their contract version pinned.
+- A contract version pinning a tool version that has been retired from the catalog MUST resolve to `tool_version_unavailable` at run dispatch.
+
+### 5.6 Runtime Settings
+
+The contract's `runtime_settings` object pins per-side execution bounds. Each field has a harness-config ceiling (§6); contract values exceeding the ceiling MUST be clamped to the ceiling at dispatch and the clamping recorded on the dossier's `version_metadata`.
 
 Fields:
 
-- `max_concurrent_agents` (integer)
-  - Default: `10`
-  - Changes SHOULD be re-applied at runtime and affect subsequent dispatch decisions.
-- `max_turns` (positive integer)
-  - Default: `20`
-  - Limits the number of coding-agent turns within one worker session.
-  - Invalid values fail configuration validation.
-- `max_retry_backoff_ms` (integer)
-  - Default: `300000` (5 minutes)
-  - Changes SHOULD be re-applied at runtime and affect future retry scheduling.
-- `max_concurrent_agents_by_state` (map `state_name -> positive integer`)
-  - Default: empty map.
-  - State keys are normalized (`lowercase`) for lookup.
-  - Invalid entries (non-positive or non-numeric) are ignored.
+- `turn_timeout_ms` (positive integer)
+  - Per-turn model invocation timeout.
+- `total_run_timeout_ms` (positive integer)
+  - Maximum wall-clock duration for one side's participation in a run.
+- `max_tokens_per_turn` (positive integer)
+- `max_total_tokens` (positive integer)
+- `temperature` (number, `0.0`–`2.0`)
+- `tool_calls_per_turn_cap` (positive integer)
+- `stall_timeout_ms` (integer, `>=0`)
+  - If `0`, stall detection is disabled. Implementation-defined whether a stall ends the side's participation immediately or after a retry.
 
-#### 5.3.6 `codex` (object)
+### 5.7 Prompt Template Rendering
 
-Fields:
-
-For Codex-owned config values such as `approval_policy`, `thread_sandbox`, and
-`turn_sandbox_policy`, supported values are defined by the targeted Codex app-server version.
-Implementors SHOULD treat them as pass-through Codex config values rather than relying on a
-hand-maintained enum in this spec. To inspect the installed Codex schema, run
-`codex app-server generate-json-schema --out <dir>` and inspect the relevant definitions referenced
-by `v2/ThreadStartParams.json` and `v2/TurnStartParams.json`. Implementations MAY validate these
-fields locally if they want stricter startup checks.
-
-- `command` (string shell command)
-  - Default: `codex app-server`
-  - The runtime launches this command via `bash -lc` in the workspace directory.
-  - The launched process MUST speak a compatible app-server protocol over stdio.
-- `approval_policy` (Codex `AskForApproval` value)
-  - Default: implementation-defined.
-- `thread_sandbox` (Codex `SandboxMode` value)
-  - Default: implementation-defined.
-- `turn_sandbox_policy` (Codex `SandboxPolicy` value)
-  - Default: implementation-defined.
-- `turn_timeout_ms` (integer)
-  - Default: `3600000` (1 hour)
-- `read_timeout_ms` (integer)
-  - Default: `5000`
-- `stall_timeout_ms` (integer)
-  - Default: `300000` (5 minutes)
-  - If `<= 0`, stall detection is disabled.
-
-### 5.4 Prompt Template Contract
-
-The Markdown body of `WORKFLOW.md` is the per-issue prompt template.
+The renderer composes the per-side per-turn prompt from the template body, the match ticket, the per-side context (§4.1.5), and the current round metadata.
 
 Rendering requirements:
 
-- Use a strict template engine (Liquid-compatible semantics are sufficient).
-- Unknown variables MUST fail rendering.
-- Unknown filters MUST fail rendering.
+- Use a strict template engine. Unknown variables MUST fail rendering. Unknown filters MUST fail rendering.
+- The renderer MUST inject only privacy-filter-projected views; raw counterparty data MUST NOT be available as a template variable.
+- Rendering errors are `template_render_error` and MUST fail the affected turn. They MUST NOT silently fall back to a default prompt.
 
-Template input variables:
+Template input variables (provided by the harness):
 
-- `issue` (object)
-  - Includes all normalized issue fields, including labels and blockers.
-- `attempt` (integer or null)
-  - `null`/absent on first attempt.
-  - Integer on retry or continuation run.
+- `match_ticket` (object) — non-sensitive ticket fields: identifier, round, round_cap, flags. Principal data is NOT in this object.
+- `principal_view` (object) — the per-side privacy-projected view of this side's principal data.
+- `counterparty_view` (object) — the per-side privacy-projected view of the counterparty available at the current disclosure stage.
+- `round` (positive integer) — the current negotiation round (1-based).
+- `prior_turns` (list of message records) — already-redacted prior exchange.
+- `rubric_dimensions` (list of strings) — the dimension names from the referenced rubric, for prompts that ask the agent to score by dimension. Weights and scoring guidance are NOT injected; those drive the deterministic aggregation, not the prompt.
 
-Fallback prompt behavior:
+Fallback behavior:
 
-- If the workflow prompt body is empty, the runtime MAY use a minimal default prompt
-  (`You are working on an issue from Linear.`).
-- Workflow file read/parse failures are configuration/validation errors and SHOULD NOT silently fall
-  back to a prompt.
+- If the prompt template body is empty after resolution, the run MUST be rejected as `empty_prompt_template`. There is no minimal default prompt fallback; the contract is the policy artifact and an empty body indicates a registry error.
 
-### 5.5 Workflow Validation and Error Surface
+### 5.8 Contract Validation and Error Surface
+
+Validation runs at registry write time AND at run dispatch time. Two passes because a contract version that was valid at write time can be invalidated by a referenced rubric or template version becoming unresolvable.
 
 Error classes:
 
-- `missing_workflow_file`
-- `workflow_parse_error`
-- `workflow_front_matter_not_a_map`
-- `template_parse_error` (during prompt rendering)
-- `template_render_error` (unknown variable/filter, invalid interpolation)
+- `missing_contract` — `(contract_id, version)` does not resolve.
+- `contract_version_mutation_error` — attempt to mutate an existing version.
+- `contract_schema_invalid` — top-level shape violation.
+- `prompt_template_unresolvable` — referenced template version not in registry.
+- `rubric_unresolvable` — referenced rubric version not in registry.
+- `rubric_missing_bias_test` — referenced rubric version has no bias-test artifact and harness is not in non-production posture.
+- `rubric_weight_sum_invalid` — dimension weights do not sum to a finite, non-zero total.
+- `tool_version_unavailable` — referenced tool version retired from catalog.
+- `runtime_settings_invalid` — settings violate harness-config ceilings or type constraints. (Note: ceiling-exceeding numeric values are clamped, not rejected, per §5.6; this error covers schema violations.)
+- `template_render_error` (during prompt rendering)
+- `empty_prompt_template`
 
 Dispatch gating behavior:
 
-- Workflow file read/YAML errors block new dispatches until fixed.
-- Template errors fail only the affected run attempt.
+- Registry-resolution errors (`missing_contract`, `prompt_template_unresolvable`, `rubric_unresolvable`, `rubric_missing_bias_test`, `tool_version_unavailable`) MUST block dispatch of the affected run. They MUST NOT block unrelated runs whose contracts resolve cleanly.
+- `template_render_error` and `empty_prompt_template` fail only the affected run.
+- A run already in flight MUST NOT be invalidated by a registry change; the resolved contract is frozen on the run.
 
 ## 6. Configuration Specification
 
