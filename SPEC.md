@@ -1935,256 +1935,217 @@ function summarize_truncated_round(run_id, round, audit_entries):
 
 ## 17. Test and Validation Matrix
 
-A conforming implementation SHOULD include tests that cover the behaviors defined in this
-specification.
+A conforming implementation MUST include tests that cover the behaviors defined in this specification. Several sections call out tests as production-CI-required (not optional) because they enforce correctness boundaries — most notably the per-run isolation invariants (§9.5) and the bias-test gating (§5.4).
 
 Validation profiles:
 
 - `Core Conformance`: deterministic tests REQUIRED for all conforming implementations.
-- `Extension Conformance`: REQUIRED only for OPTIONAL features that an implementation chooses to
-  ship.
-- `Real Integration Profile`: environment-dependent smoke/integration checks RECOMMENDED before
-  production use.
+- `Production Gate`: a strict subset of Core Conformance whose tests MUST be in the production CI gate. Failure blocks deployment.
+- `Real Integration Profile`: environment-dependent integration checks RECOMMENDED before production use.
 
-Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bullets that begin with
-`If ... is implemented` are `Extension Conformance`.
+Sections 17.1 through 17.10 are `Core Conformance`. Items explicitly marked `Production Gate` MUST gate deployments; the rest gate merge.
 
-### 17.1 Workflow and Config Parsing
+### 17.1 Registry Resolution and Validation (§5)
 
-- Workflow file path precedence:
-  - explicit runtime path is used when provided
-  - cwd default is `WORKFLOW.md` when no explicit runtime path is provided
-- Workflow file changes are detected and trigger re-read/re-apply without restart
-- Invalid workflow reload keeps last known good effective configuration and emits an
-  operator-visible error
-- Missing `WORKFLOW.md` returns typed error
-- Invalid YAML front matter returns typed error
-- Front matter non-map returns typed error
-- Config defaults apply when OPTIONAL values are missing
-- `tracker.kind` validation enforces currently supported kind (`linear`)
-- `tracker.api_key` works (including `$VAR` indirection)
-- `$VAR` resolution works for tracker API key and path values
-- `~` path expansion works
-- `codex.command` is preserved as a shell command string
-- Per-state concurrency override map normalizes state names and ignores invalid values
-- Prompt template renders `issue` and `attempt`
-- Prompt rendering fails on unknown variables (strict mode)
+- `(contract_id, version)` resolves to one immutable definition; mutation of an existing version is rejected as `contract_version_mutation_error`. **Production Gate.**
+- Contract schema validation rejects missing required fields, invalid `side`, malformed refs.
+- Prompt template registry refuses to embed dimension weights or scoring guidance — validation gate that MUST scan template content for known weight/guidance markers.
+- Rubric `weight_total` equals the sum of dimension weights at registry write time. **Production Gate.**
+- Production posture refuses to dispatch a run whose rubric reference lacks `bias_test_ref`, surfaced as `rubric_missing_bias_test`. **Production Gate.**
+- Tool descriptors validate input/output schemas; tool-version retired from catalog surfaces as `tool_version_unavailable` at dispatch.
+- Runtime settings exceeding harness-config ceilings are clamped, not rejected, and the clamping is recorded on the dossier (§5.6).
 
-### 17.2 Workspace Manager and Safety
+### 17.2 Match Ticket Integration (§11)
 
-- Deterministic workspace path per issue identifier
-- Missing workspace directory is created
-- Existing workspace directory is reused
-- Existing non-directory path at workspace location is handled safely (replace or fail per
-  implementation policy)
-- OPTIONAL workspace population/synchronization errors are surfaced
-- `after_create` hook runs only on new workspace creation
-- `before_run` hook runs before each attempt and failure/timeouts abort the current attempt
-- `after_run` hook runs after each attempt and failure/timeouts are logged and ignored
-- `before_remove` hook runs on cleanup and failures/timeouts are ignored
-- Workspace path sanitization and root containment invariants are enforced before agent launch
-- Agent launch uses the per-issue workspace path as cwd and rejects out-of-root paths
+- `read_match_ticket` returns the §4.1.1 fields plus both side ticket records.
+- `read_principal_data` enforces field-level access; calls outside the privacy-projection layer surface as `principal_data_unauthorized`.
+- `claim_run` is conditionally idempotent: a second call with the same `(match_ticket_id, run_id)` succeeds (recovery); with a different `run_id` while one is in flight surfaces as `match_ticket_concurrent_run_claimed`.
+- `record_state_transition` succeeds only when current state matches `from_state`; mismatch surfaces as `match_ticket_state_transition_conflict`.
+- `attach_dossier` increments dossier version atomically with the terminal-state transition.
+- Schema-version mismatch surfaces as `match_ticket_schema_unexpected`.
+- Raw SQL paths bypass the typed client are rejected at lint/type-check (test enforces no `client.raw(`-style calls outside the adapter).
 
-### 17.3 Issue Tracker Client
+### 17.3 Run-State Machine and Coordinator (§7, §8)
 
-- Candidate issue fetch uses active states and project slug
-- Linear query uses the specified project filter field (`slugId`)
-- Empty `fetch_issues_by_states([])` returns empty without API call
-- Pagination preserves order across multiple pages
-- Blockers are normalized from inverse relations of type `blocks`
-- Labels are normalized to lowercase
-- Issue state refresh by ID returns minimal normalized issues
-- Issue state refresh query uses GraphQL ID typing (`[ID!]`) as specified in Section 11.2
-- Error mapping for request errors, non-200, GraphQL errors, malformed payloads
+- All §7.3 transitions are exercised by the coordinator in deterministic test scenarios.
+- Round counter increments only on `employer_filtering → round_complete` transition.
+- Round cap is the minimum of contract contributions bounded by `runs.default_round_cap`.
+- Strict alternation: seeker speaks first in every round; employer responds.
+- Both-sides-`done` short-circuits to `scoring` only if signaled in the same round.
+- Round-cap reached transitions to `scoring` regardless of `done` signals.
+- Coordinator restart resumes from the last persisted Inngest step; audit-log replay validation detects divergence and surfaces `audit_step_divergence`. **Production Gate.**
+- Inngest function concurrency keys are declared per §8.3.
+- `match_ticket.invalidating_state_change` consumed mid-run transitions to `aborted` per §7.3.
+- `total_run_timeout` triggers best-effort `inconclusive` dossier path before terminating as `timed_out`.
+- Step-level retry budgets exhaust into the appropriate §7.3 terminal states.
+- No run-level retry exists; only `match_ticket.renegotiation_requested` produces a new `run_id`.
 
-### 17.4 Orchestrator Dispatch, Reconciliation, and Retry
+### 17.4 Negotiation Context and Isolation Invariants (§9)
 
-- Dispatch sort order is priority then oldest creation time
-- `Todo` issue with non-terminal blockers is not eligible
-- `Todo` issue with terminal blockers is eligible
-- Active-state issue refresh updates running entry state
-- Non-active state stops running agent without workspace cleanup
-- Terminal state stops running agent and cleans workspace
-- Reconciliation with no running issues is a no-op
-- Normal worker exit schedules a short continuation retry (attempt 1)
-- Abnormal worker exit increments retries with 10s-based exponential backoff
-- Retry backoff cap uses configured `agent.max_retry_backoff_ms`
-- Retry queue entries include attempt, due time, identifier, and error
-- Stall detection kills stalled sessions and schedules retry
-- Slot exhaustion requeues retries with explicit error reason
-- If a snapshot API is implemented, it returns running rows, retry rows, token totals, and rate
-  limits
-- If a snapshot API is implemented, timeout/unavailable cases are surfaced
+- Context is per `(run_id, side)`; storage keyed only by `principal_id` is rejected at type-check.
+- Cross-match prompt-injection invariant: instructions injected into match ticket A's untrusted text MUST NOT influence match ticket B's behavior. **Production Gate.**
+- Per-side isolation invariant: seeker context and employer context within one run MUST NOT share storage. **Production Gate.**
+- Counterparty access invariant: side runners read counterparty data only through `counterparty_view` or `counterparty_filtered` tool results. The harness MUST surface a type-level prohibition test that prevents passing raw counterparty principal records to a side runner's prompt assembly. **Production Gate.**
+- Counterparty view evolves only via the privacy filter; direct writes from outside the filter surface as test failure.
+- Context destruction on terminal transition emits `context_released` audit entry.
+- Re-negotiation runs start with fresh contexts; prior context state, prompt history, and rubric scratch MUST NOT persist across `run_id` boundaries.
 
-### 17.5 Coding-Agent App-Server Client
+### 17.5 Side Agent Runner Protocol (§10)
 
-- Launch command uses workspace cwd and invokes `bash -lc <codex.command>`
-- Session startup follows the targeted Codex app-server protocol.
-- Client identity/capability payloads are valid when the targeted Codex app-server protocol requires
-  them.
-- Policy-related startup payloads use the implementation's documented approval/sandbox settings
-- Thread and turn identities exposed by the targeted protocol are extracted and used to emit
-  `session_started`
-- Request/response read timeout is enforced
-- Turn timeout is enforced
-- Transport framing required by the targeted protocol is handled correctly
-- For stdio-based transports, diagnostic stderr handling is kept separate from the protocol stream
-- Command/file-change approvals are handled according to the implementation's documented policy
-- Unsupported dynamic tool calls are rejected without stalling the session
-- User input requests are handled according to the implementation's documented policy and do not
-  stall indefinitely
-- Usage and rate-limit telemetry exposed by the targeted protocol is extracted
-- Approval, user-input-required, usage, and rate-limit signals are interpreted according to the
-  targeted protocol
-- If client-side tools are implemented, session startup advertises the supported tool specs
-  using the targeted app-server protocol
-- If the `linear_graphql` client-side tool extension is implemented:
-  - the tool is advertised to the session
-  - valid `query` / `variables` inputs execute against configured Linear auth
-  - top-level GraphQL `errors` produce `success=false` while preserving the GraphQL body
-  - invalid arguments, missing auth, and transport failures return structured failure payloads
-  - unsupported tool names still fail without stalling the session
+- Side runner resolves contract, applies §5.6 ceiling clamps, and records clamping on audit.
+- Tool calls validate against the contract's `tool_surface`; unsupported tool names return `tool_unsupported` and the turn continues.
+- Tool input/output schema validation surfaces `tool_input_invalid` / `tool_output_invalid`.
+- Tool calls beyond `tool_calls_per_turn_cap` return `tool_call_cap_exceeded`.
+- Disclosure-class routing: `counterparty_filtered` tool outputs MUST traverse the privacy filter even when invoked by the principal's own side. **Production Gate.**
+- The harness tool dispatcher is the only path that invokes tools; direct tRPC/SDK calls from side-runner code are rejected at type-check.
+- Structured output schemas validated for both negotiation and scoring phases (§10.4).
+- Holistic-score-from-model: any single-number score in the model's output is ignored and audited; the harness computes the deterministic weighted total. **Production Gate.**
+- Per-turn timeout, total-run timeout, gateway transport retry budget, and tool-call retry budget all enforced.
+- Run-to-completion: no harness-supplied tool advertises human-input semantics. Test scans the catalog and rejects matches.
 
-### 17.6 Observability
+### 17.6 Privacy Filter (§3.1, §15.2)
 
-- Validation failures are operator-visible
-- Structured logging includes issue/session context fields
-- Logging sink failures do not crash orchestration
-- Token/rate-limit aggregation remains correct across repeated agent updates
-- If a human-readable status surface is implemented, it is driven from orchestrator state and does
-  not affect correctness
-- If humanized event summaries are implemented, they cover key wrapper/agent event classes without
-  changing orchestrator behavior
+- Privacy filter is deterministic; same source content + ruleset version + disclosure stage produces byte-identical projections across runs. **Production Gate.**
+- Privacy filter contains no model invocation; test asserts no gateway client is reachable from the filter call graph. **Production Gate.**
+- Stage-aware: progressing through `disclosure_stages` relaxes only the rules flagged at each stage.
+- Untrusted-input sanitization caps length per `privacy.untrusted_input_max_chars` and emits `untrusted_input_truncated` audit entry on truncation.
+- Sentinel-injection: a malicious payload containing forged `<<<UNTRUSTED_END>>>` strings cannot break out of its wrapping; the per-run nonce defense is exercised by an explicit attack test. **Production Gate.**
+- Failing closed: ambiguous schema fields project to the more restrictive option; `filter_ambiguity` surfaces.
 
-### 17.7 CLI and Host Lifecycle
+### 17.7 Prompt Construction (§12)
 
-- CLI accepts a positional workflow path argument (`path-to-WORKFLOW.md`)
-- CLI uses `./WORKFLOW.md` when no workflow path argument is provided
-- CLI errors on nonexistent explicit workflow path or missing default `./WORKFLOW.md`
-- CLI surfaces startup failure cleanly
-- CLI exits with success when application starts and shuts down normally
-- CLI exits nonzero when startup fails or the host process exits abnormally
+- Strict template engine: unknown variables and unknown filters fail rendering.
+- Per-turn prompt assembly produces deterministic output for identical context + contract; prompt hash recorded in §10.2 step 5 audit.
+- Untrusted-input wrapping uses a per-run nonce; same field across two runs of the same content produces different sentinel strings.
+- Untrusted free-text fields are wrapped; structured/typed fields are not.
+- History truncation preserves system message and current views; older rounds collapse to deterministic harness-generated summaries (no model call). **Production Gate.**
+- View-block serialization is byte-deterministic across iterations of the same content.
+- Phase-specific assembly: scoring-phase preamble disallows holistic single score; full tool surface remains available.
 
-### 17.8 Real Integration Profile (RECOMMENDED)
+### 17.8 Audit Log and Transcript Store (§13)
 
-These checks are RECOMMENDED for production readiness and MAY be skipped in CI when credentials,
-network access, or external service permissions are unavailable.
+- Audit log is append-only; update/delete attempts are rejected.
+- Hash chain (when enabled): each entry's `prev_entry_hash` resolves to a valid prior entry; chain divergence surfaces `audit_chain_divergence`. **Production Gate.**
+- Audit-write retry budget exhaustion terminates the run with `tool_failure`; entries are NOT silently dropped. **Production Gate.**
+- Free-text payloads in audit entries are redacted; canonical content is in the transcript store. Test scans audit-entry payloads for principal-data patterns and fails on hits.
+- Canonical transcript store is content-addressable; orphan references surface `audit_orphan_reference`.
+- Audit retention is no shorter than the regulatory floor for the configured environment.
 
-- A real tracker smoke test can be run with valid credentials supplied by `LINEAR_API_KEY` or a
-  documented local bootstrap mechanism (for example `~/.linear_api_key`).
-- Real integration tests SHOULD use isolated test identifiers/workspaces and clean up tracker
-  artifacts when practical.
-- A skipped real-integration test SHOULD be reported as skipped, not silently treated as passed.
-- If a real-integration profile is explicitly enabled in CI or release validation, failures SHOULD
-  fail that job.
+### 17.9 Dossier Production (§4.1.8, §16.6)
+
+- Dossier produced for every terminal `complete` and `inconclusive` transition; `aborted`/`timed_out`/`tool_failure` produce best-effort `inconclusive` dossiers when possible.
+- `outcome=complete` requires both sides to have scored every dimension; missing dimensions force `inconclusive`.
+- Weighted total is computed deterministically per §16.7; test verifies byte-identical totals for identical dimension scores + rubric.
+- Per-audience transcript projections are pre-computed and stored on the dossier.
+- Dossier signing (when enabled) covers all fields except the signature object using deterministic canonical serialization. Verification helper validates round-trip. **Production Gate.**
+- Re-negotiation produces a new dossier with `version > prior version` on the same `match_ticket_id`.
+
+### 17.10 Failure Model and Recovery (§14)
+
+- Each §14.1 failure class has at least one test exercising the §14.2 recovery behavior.
+- No run-level retry: terminal transitions are final.
+- Restart recovery resumes Inngest-persisted runs; orphaned in-flight runs are marked `tool_failure` at startup.
+- Persisted-but-not-emitted dossiers are re-emitted at startup.
+- Operator force-termination emits `operator_action` audit entry and synthetic `match_ticket.invalidating_state_change`.
+
+### 17.11 Real Integration Profile (RECOMMENDED)
+
+Environment-dependent checks RECOMMENDED before production use. MAY be skipped in CI when external service access is unavailable.
+
+- Vercel AI Gateway smoke test against a sandbox API key.
+- Inngest signing-key round-trip against the staging Inngest endpoint.
+- Postgres match-ticket store smoke test against a non-production database.
+- Audit log hash-chain integrity verification on a representative sample of runs.
+- Dossier signing key rotation drill: a dossier signed under key A verifies after rotation to key B (because the audit entry records `signer_key_id`).
+- Skipped real-integration tests SHOULD be reported as skipped, not silently passed.
+- When real-integration tests are enabled in CI/release validation, failures MUST fail that job.
 
 ## 18. Implementation Checklist (Definition of Done)
 
-Use the same validation profiles as Section 17:
+Validation profiles align with §17:
 
-- Section 18.1 = `Core Conformance`
-- Section 18.2 = `Extension Conformance`
-- Section 18.3 = `Real Integration Profile`
+- §18.1 = `Core Conformance` (REQUIRED for any conforming implementation)
+- §18.2 = `Production Gate` (REQUIRED in production)
+- §18.3 = `Real Integration Profile` (RECOMMENDED before production cutover)
 
 ### 18.1 REQUIRED for Conformance
 
-- Workflow path selection supports explicit runtime path and cwd default
-- `WORKFLOW.md` loader with YAML front matter + prompt body split
-- Typed config layer with defaults and `$` resolution
-- Dynamic `WORKFLOW.md` watch/reload/re-apply for config and prompt
-- Polling orchestrator with single-authority mutable state
-- Issue tracker client with candidate fetch + state refresh + terminal fetch
-- Workspace manager with sanitized per-issue workspaces
-- Workspace lifecycle hooks (`after_create`, `before_run`, `after_run`, `before_remove`)
-- Hook timeout config (`hooks.timeout_ms`, default `60000`)
-- Coding-agent app-server subprocess client with JSON line protocol
-- Codex launch command config (`codex.command`, default `codex app-server`)
-- Strict prompt rendering with `issue` and `attempt` variables
-- Exponential retry queue with continuation retries after normal exit
-- Configurable retry backoff cap (`agent.max_retry_backoff_ms`, default 5m)
-- Reconciliation that stops runs on terminal/non-active tracker states
-- Workspace cleanup for terminal issues (startup sweep + active transition)
-- Structured logs with `issue_id`, `issue_identifier`, and `session_id`
-- Operator-visible observability (structured logs; OPTIONAL snapshot/status surface)
+Registry and policy:
 
-### 18.2 RECOMMENDED Extensions (Not REQUIRED for Conformance)
+- Versioned agent contract registry with immutable `(contract_id, version)` resolution.
+- Versioned prompt template registry referenced from contracts; templates do not embed rubric weights or guidance.
+- Versioned scoring rubric registry with deterministic weighted aggregation.
+- Versioned privacy ruleset registry with disclosure stages and untrusted-input policy.
+- Tool catalog with per-descriptor `disclosure_class` declarations.
 
-- HTTP server extension honors CLI `--port` over `server.port`, uses a safe default bind host, and
-  exposes the baseline endpoints/error semantics in Section 13.7 if shipped.
-- `linear_graphql` client-side tool extension exposes raw Linear GraphQL access through the
-  app-server session using configured Symphony auth.
-- TODO: Persist retry queue and session metadata across process restarts.
-- TODO: Make observability settings configurable in workflow front matter without prescribing UI
-  implementation details.
-- TODO: Add first-class tracker write APIs (comments/state transitions) in the orchestrator instead
-  of only via agent tools.
-- TODO: Add pluggable issue tracker adapters beyond Linear.
+Harness runtime:
 
-### 18.3 Operational Validation Before Production (RECOMMENDED)
+- Inngest functions: `dispatcher`, `coordinator`, `side_runner_seeker`, `side_runner_employer`, `privacy_filter`, `dossier_producer`, `run_invalidator`.
+- Coordinator drives the §7 run-state machine; transitions emit audit entries.
+- Per-side context manager with the §9.5 isolation invariants enforced at type level where possible.
+- Vercel AI Gateway integration with primary + fallback model selection.
+- Tool dispatcher enforcing contract surface, schema validation, and disclosure-class routing.
+- Deterministic privacy filter applying ruleset rules, sanitizing untrusted input, failing closed.
+- Dossier producer with deterministic weighted totals and per-audience transcript projections.
 
-- Run the `Real Integration Profile` from Section 17.8 with valid credentials and network access.
-- Verify hook execution and workflow path resolution on the target host OS/shell environment.
-- If the OPTIONAL HTTP server is shipped, verify the configured port behavior and loopback/default
-  bind expectations on the target environment.
+Domain integrations:
 
-## Appendix A. SSH Worker Extension (OPTIONAL)
+- Match ticket store operations (§11.1) including conditional `claim_run` and `record_state_transition`.
+- Audit log with append-only persistence and (in production posture) hash chain.
+- Canonical transcript store with content-addressable storage and lifecycle aligned to audit retention.
 
-This appendix describes a common extension profile in which Symphony keeps one central
-orchestrator but executes worker runs on one or more remote hosts over SSH.
+Configuration:
 
-Extension config:
+- Harness config layer with §6.4 fields, validated at startup.
+- Process-scoped config (no hot reload); `harness_config_loaded` audit emitted at startup.
+- Concurrency keys per §8.3.
 
-- `worker.ssh_hosts` (list of SSH host strings, OPTIONAL)
-  - When omitted, work runs locally.
-- `worker.max_concurrent_agents_per_host` (positive integer, OPTIONAL)
-  - Shared per-host cap applied across configured SSH hosts.
+Observability:
 
-### A.1 Execution Model
+- Structured operator logs with `run_id`, `match_ticket_identifier`, `harness_version`, `inngest_function_name`.
+- Metrics per §13.6 emitted to operator monitoring.
+- Audit-quality signals (chain divergence, write-retry exhaustion, orphan reference, step divergence) alerted in real time AND audited.
 
-- The orchestrator remains the single source of truth for polling, claims, retries, and
-  reconciliation.
-- `worker.ssh_hosts` provides the candidate SSH destinations for remote execution.
-- Each worker run is assigned to one host at a time, and that host becomes part of the run's
-  effective execution identity along with the issue workspace.
-- `workspace.root` is interpreted on the remote host, not on the orchestrator host.
-- The coding-agent app-server is launched over SSH stdio instead of as a local subprocess, so the
-  orchestrator still owns the session lifecycle even though commands execute remotely.
-- Continuation turns inside one worker lifetime SHOULD stay on the same host and workspace.
-- A remote host SHOULD satisfy the same basic contract as a local worker environment: reachable
-  shell, writable workspace root, coding-agent executable, and any required auth or repository
-  prerequisites.
+Tests:
 
-### A.2 Scheduling Notes
+- All §17 Core Conformance tests pass.
+- All §17 items marked `Production Gate` are wired into the deployment-blocking CI lane.
 
-- SSH hosts MAY be treated as a pool for dispatch.
-- Implementations MAY prefer the previously used host on retries when that host is still
-  available.
-- `worker.max_concurrent_agents_per_host` is an OPTIONAL shared per-host cap across configured SSH
-  hosts.
-- When all SSH hosts are at capacity, dispatch SHOULD wait rather than silently falling back to a
-  different execution mode.
-- Implementations MAY fail over to another host when the original host is unavailable before work
-  has meaningfully started.
-- Once a run has already produced side effects, a transparent rerun on another host SHOULD be
-  treated as a new attempt, not as invisible failover.
+### 18.2 Production Gate REQUIREMENTS (REQUIRED in Production)
 
-### A.3 Problems to Consider
+These are the production-blocking requirements distinct from general conformance.
 
-- Remote environment drift:
-  - Each host needs the expected shell environment, coding-agent executable, auth, and repository
-    prerequisites.
-- Workspace locality:
-  - Workspaces are usually host-local, so moving an issue to a different host is typically a cold
-    restart unless shared storage exists.
-- Path and command safety:
-  - Remote path resolution, shell quoting, and workspace-boundary checks matter more once execution
-    crosses a machine boundary.
-- Startup and failover semantics:
-  - Implementations SHOULD distinguish host-connectivity/startup failures from in-workspace agent
-    failures so the same ticket is not accidentally re-executed on multiple hosts.
-- Host health and saturation:
-  - A dead or overloaded host SHOULD reduce available capacity, not cause duplicate execution or an
-    accidental fallback to local work.
-- Cleanup and observability:
-  - Operators need to know which host owns a run, where its workspace lives, and whether cleanup
-    happened on the right machine.
+- Cross-match prompt-injection containment test (§17.4) is in the production CI gate.
+- Per-side isolation invariant test (§17.4) is in the production CI gate.
+- Counterparty-access type-level prohibition test (§17.4) is in the production CI gate.
+- Holistic-score-from-model rejection test (§17.5) is in the production CI gate.
+- Disclosure-class routing test for `counterparty_filtered` tool outputs (§17.5) is in the production CI gate.
+- Privacy-filter determinism test (§17.6) is in the production CI gate.
+- Privacy-filter no-model-invocation test (§17.6) is in the production CI gate.
+- Sentinel-injection attack test (§17.6) is in the production CI gate.
+- History-truncation summary determinism test (§17.7) is in the production CI gate.
+- Audit hash-chain divergence detection test (§17.8) is in the production CI gate.
+- Audit-write retry exhaustion → run termination test (§17.8) is in the production CI gate.
+- Dossier signing scope and verification round-trip test (§17.9) is in the production CI gate.
+- Coordinator restart audit-replay divergence test (§17.3) is in the production CI gate.
+- Bias-test gating: production posture refuses dispatches with rubrics lacking `bias_test_ref` (§17.1) is in the production CI gate.
+- Rubric weight-sum invariant test (§17.1) is in the production CI gate.
+- Contract-version immutability test (§17.1) is in the production CI gate.
+
+Operational:
+
+- Dossier signing key references are populated and verified at startup.
+- Audit retention class set to no shorter than the regulatory floor.
+- Bias-test artifacts are present in the rubric registry for every rubric version pinned by an active production contract.
+- Operator API requires authentication; auditor role is provisioned for compliance review.
+
+### 18.3 Operational Validation Before Production Cutover (RECOMMENDED)
+
+- Run §17.11 Real Integration Profile against staging gateway, Inngest, Postgres.
+- Verify Inngest function deploy parity between staging and production.
+- Run a dossier-signing key rotation drill end-to-end.
+- Verify audit log retention configuration in production storage matches the regulatory floor.
+- Validate bias-test artifacts for all rubric versions used by the initial production contract set.
+- Run a production-shaped load test exercising the §8.3 concurrency caps.
+- Smoke test the operator API authentication and auditor read-only paths.
+- Verify the JobBobber product UI consumes `dossier.produced` events correctly and renders dossiers per audience-projected transcripts.
