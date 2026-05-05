@@ -151,144 +151,247 @@ Downstream consumers of the `dossier.produced` event (notification service, ATS 
 
 ### 4.1 Entities
 
-#### 4.1.1 Issue
+#### 4.1.1 Match Ticket
 
-Normalized issue record used by orchestration, prompt rendering, and observability output.
+Normalized match-ticket record used by the negotiation coordinator, prompt assembly, the privacy filter, and the audit log. Read by the Match Ticket Reader (§3.1) and frozen for the duration of one negotiation run.
 
 Fields:
 
-- `id` (string)
-  - Stable tracker-internal ID.
+- `id` (string, UUID)
+  - Stable database-internal identifier for the match ticket.
 - `identifier` (string)
-  - Human-readable ticket key (example: `ABC-123`).
-- `title` (string)
-- `description` (string or null)
-- `priority` (integer or null)
-  - Lower numbers are higher priority in dispatch sorting.
-- `state` (string)
-  - Current tracker state name.
-- `branch_name` (string or null)
-  - Tracker-provided branch metadata if available.
-- `url` (string or null)
-- `labels` (list of strings)
-  - Normalized to lowercase.
-- `blocked_by` (list of blocker refs)
-  - Each blocker ref contains:
-    - `id` (string or null)
-    - `identifier` (string or null)
-    - `state` (string or null)
-- `created_at` (timestamp or null)
-- `updated_at` (timestamp or null)
+  - Human-readable match key (example: `MT-2026-04812`). Used in audit logs and operator surfaces.
+- `seeker_ticket_id` (string, UUID)
+  - Foreign key to the seeker-side ticket that generated this match.
+- `employer_ticket_id` (string, UUID)
+  - Foreign key to the employer-side ticket that generated this match.
+- `state` (string, enum)
+  - Current match-ticket state. Member of the run-state machine (§7).
+- `round` (integer, `>=0`)
+  - Current negotiation round counter. Bounded by the run's `round_cap`.
+- `round_cap` (integer, `>=1`)
+  - Hard upper bound on negotiation rounds for this ticket. Resolved from the agent contract at run start; recorded on the ticket so it cannot drift mid-run.
+- `seeker_contract_ref` (object)
+  - Pointer to the seeker-side agent contract version applied to this run: `{contract_id, version}`. See §4.1.2.
+- `employer_contract_ref` (object)
+  - Pointer to the employer-side agent contract version applied to this run: `{contract_id, version}`.
+- `privacy_ruleset_ref` (object)
+  - Pointer to the privacy-filter rule set version applied to this run: `{ruleset_id, version}`. See §4.1.7.
+- `flags` (list of strings)
+  - Normalized to lowercase. Examples: `visa_required`, `remote_only`, `urgent`. Surface signal for routing and operator visibility; not used for scoring.
+- `dossier_id` (string, UUID, or null)
+  - Foreign key to the produced dossier. Null until the run completes.
+- `created_at` (timestamp)
+- `updated_at` (timestamp)
 
-#### 4.1.2 Workflow Definition
+The principal-side data each agent receives (profile, comp range, role/intent metadata) is NOT a field on the match ticket itself; it is resolved at run start from the seeker and employer ticket records, projected through the privacy filter, and held in the per-side context (§4.1.5). The match ticket holds the references and the run-state machine; the ephemeral context holds what the agent reads.
 
-Parsed `WORKFLOW.md` payload:
+#### 4.1.2 Agent Contract
 
-- `config` (map)
-  - YAML front matter root object.
-- `prompt_template` (string)
-  - Markdown body after front matter, trimmed.
+Versioned definition of one side's agent behavior for one run. Loaded by the Agent Contract Loader (§3.1), frozen at run start, and recorded by reference on the dossier (§4.1.8) for audit reconstruction.
 
-#### 4.1.3 Service Config (Typed View)
+Fields:
 
-Typed runtime values derived from `WorkflowDefinition.config` plus environment resolution.
+- `contract_id` (string)
+  - Stable identifier of the contract (e.g. `seeker.standard_v1`, `employer.executive_search_v3`).
+- `version` (string)
+  - Immutable version tag (semver or content hash). The pair `(contract_id, version)` MUST resolve to one definition for all time.
+- `side` (string, enum: `seeker` | `employer`)
+  - Which principal this contract acts on behalf of.
+- `prompt_template_ref` (object)
+  - Pointer to the versioned prompt template: `{template_id, version}`. The template body is loaded from the prompt registry; only the reference lives on the contract.
+- `rubric_ref` (object)
+  - Pointer to the versioned scoring rubric for this side: `{rubric_id, version}`. See §4.1.6.
+- `tool_surface` (list of tool descriptors)
+  - Tools the agent MAY invoke during the run. Each descriptor is a `{name, version, input_schema, output_schema}` tuple. See §10 (Agent Runner Protocol) for invocation semantics.
+- `model` (object)
+  - `{provider, model_id, fallback}` — primary and fallback model selection. Resolved through the Vercel AI Gateway.
+- `runtime_settings` (object)
+  - Per-side timeouts, max-tokens budgets, temperature settings, and tool-call limits. Bounded by the harness config layer (§3.1).
+- `round_cap_contribution` (integer, `>=1`)
+  - The maximum rounds this side will participate in. The match ticket's effective `round_cap` is the minimum of the two sides' contributions.
+
+#### 4.1.3 Harness Config (Typed View)
+
+Typed runtime values derived from environment resolution and harness defaults. Read by the negotiation coordinator before dispatch.
 
 Examples:
 
-- poll interval
-- workspace root
-- active and terminal issue states
-- concurrency limits
-- coding-agent executable/args/timeouts
-- workspace hooks
+- max concurrent runs (global Inngest concurrency cap)
+- per-side timeout ceilings
+- gateway endpoint and signing config
+- audit log retention class
+- dossier signing key reference (if dossier signing is enabled, see §15)
+- privacy ruleset cache TTL
+- model fallback policy
 
-#### 4.1.4 Workspace
+#### 4.1.4 Negotiation Run
 
-Filesystem workspace assigned to one issue identifier.
-
-Fields (logical):
-
-- `path` (absolute workspace path)
-- `workspace_key` (sanitized issue identifier)
-- `created_now` (boolean, used to gate `after_create` hook)
-
-#### 4.1.5 Run Attempt
-
-One execution attempt for one issue.
+One execution of the harness for one match ticket. The unit the negotiation coordinator owns and the audit log keys against.
 
 Fields (logical):
 
-- `issue_id`
-- `issue_identifier`
-- `attempt` (integer or null, `null` for first run, `>=1` for retries/continuation)
-- `workspace_path`
-- `started_at`
-- `status`
-- `error` (OPTIONAL)
+- `run_id` (string, UUID)
+  - Stable identifier for this run. New `run_id` per re-negotiation.
+- `match_ticket_id` (string, UUID)
+- `match_ticket_identifier` (string)
+- `attempt` (integer, `>=1`)
+  - 1 for the first negotiation; `>=2` for re-negotiation runs on the same match ticket.
+- `seeker_contract_ref` (object)
+  - Frozen at run start from the match ticket.
+- `employer_contract_ref` (object)
+  - Frozen at run start from the match ticket.
+- `privacy_ruleset_ref` (object)
+  - Frozen at run start from the match ticket.
+- `started_at` (timestamp)
+- `completed_at` (timestamp or null)
+- `status` (string, enum)
+  - Current run status; see §7.
+- `termination_reason` (string, enum or null)
+  - One of `dossier_complete`, `dossier_inconclusive`, `round_cap_reached`, `tool_failure`, `timeout`, `aborted_match_state_change`. Null while the run is in flight.
+- `dossier_id` (string, UUID, or null)
+  - Reference to the produced dossier. Set on terminal transition.
 
-#### 4.1.6 Live Session (Agent Session Metadata)
+#### 4.1.5 Negotiation Context (Per-Side)
 
-State tracked while a coding-agent subprocess is running.
-
-Fields:
-
-- `session_id` (string, `<thread_id>-<turn_id>`)
-- `thread_id` (string)
-- `turn_id` (string)
-- `codex_app_server_pid` (string or null)
-- `last_codex_event` (string/enum or null)
-- `last_codex_timestamp` (timestamp or null)
-- `last_codex_message` (summarized payload)
-- `codex_input_tokens` (integer)
-- `codex_output_tokens` (integer)
-- `codex_total_tokens` (integer)
-- `last_reported_input_tokens` (integer)
-- `last_reported_output_tokens` (integer)
-- `last_reported_total_tokens` (integer)
-- `turn_count` (integer)
-  - Number of coding-agent turns started within the current worker lifetime.
-
-#### 4.1.7 Retry Entry
-
-Scheduled retry state for an issue.
+Owned by the Negotiation Context Manager (§3.1). Per-side, per-run, ephemeral. MUST NOT be shared across runs even when the same principal's agent is acting on multiple match tickets concurrently. This is the prompt-injection containment boundary.
 
 Fields:
 
-- `issue_id`
-- `identifier` (best-effort human ID for status surfaces/logs)
-- `attempt` (integer, 1-based for retry queue)
-- `due_at_ms` (monotonic clock timestamp)
-- `timer_handle` (runtime-specific timer reference)
-- `error` (string or null)
+- `run_id` (string, UUID)
+- `side` (string, enum: `seeker` | `employer`)
+- `principal_view` (object)
+  - The privacy-filter-projected view of this side's principal data the agent operates on. Built once at run start; tools may augment it during the run, but principal data not in the initial view MUST come through the privacy filter or a contract-allowed tool.
+- `counterparty_view` (object)
+  - The privacy-filter-projected view of the other side's data this side is currently allowed to see. Updates through the privacy filter as the negotiation progresses and rules permit further disclosure.
+- `prompt_history` (list of message records)
+  - The model session's message log for this side, including system, user, assistant, and tool-call/result entries.
+- `tool_call_log` (list of tool-call records)
+  - Each entry: `{tool_name, version, args_redacted, result_summary, started_at, completed_at, status}`.
+- `rubric_scratch` (object)
+  - Per-dimension working state for this side's rubric scoring. The final dimension scores are computed from this; the harness records both the scratch state and the final scores on the dossier for audit.
+- `started_at` (timestamp)
 
-#### 4.1.8 Orchestrator Runtime State
+#### 4.1.6 Scoring Rubric (Versioned)
 
-Single authoritative in-memory state owned by the orchestrator.
+Structured definition of how one side scores a match. Versioned, bias-tested per version, and referenced (not embedded) by the agent contract (§4.1.2).
 
 Fields:
 
-- `poll_interval_ms` (current effective poll interval)
-- `max_concurrent_agents` (current effective global concurrency limit)
-- `running` (map `issue_id -> running entry`)
-- `claimed` (set of issue IDs reserved/running/retrying)
-- `retry_attempts` (map `issue_id -> RetryEntry`)
-- `completed` (set of issue IDs; bookkeeping only, not dispatch gating)
-- `codex_totals` (aggregate tokens + runtime seconds)
-- `codex_rate_limits` (latest rate-limit snapshot from agent events)
+- `rubric_id` (string)
+  - Stable identifier (e.g. `seeker.standard`, `employer.executive_search`).
+- `version` (string)
+  - Immutable version tag. Bias-testing artifacts MUST be linked from the version record.
+- `side` (string, enum: `seeker` | `employer`)
+- `dimensions` (list of dimension definitions)
+  - Each dimension: `{name, weight, scoring_guidance, anchor_examples}` where `anchor_examples` describes what a 1, 3, 5, 7, and 9 score look like for that dimension.
+- `weight_total` (number)
+  - MUST equal the sum of dimension weights. Recorded explicitly so a dossier audit can verify the deterministic weighted-total computation without recomputing from the dimension list.
+- `aggregation` (string, enum)
+  - How dimension scores combine into the headline score. Default `weighted_mean`. The harness MUST compute the aggregate deterministically from the dimension scores; the model MUST NOT be asked for a holistic single number (§5).
+- `bias_test_ref` (object)
+  - Pointer to the bias-testing artifact for this rubric version: `{artifact_id, performed_at, result_summary}`. Required for compliance.
+
+#### 4.1.7 Privacy Filter Ruleset (Versioned)
+
+The deterministic rule set the privacy filter (§3.1) applies to every cross-side message and every tool-returned content fragment. Versioned and recorded by reference on each match ticket.
+
+Fields:
+
+- `ruleset_id` (string)
+- `version` (string)
+- `redaction_rules` (list of rule entries)
+  - Each entry describes a field or pattern, the redaction action (drop, mask, hash, generalize), and the disclosure stage at which the rule may be relaxed.
+- `disclosure_stages` (ordered list of stage names)
+  - Negotiation rounds advance through stages; each stage MAY relax specific rules. The harness records which stage was active for each cross-side projection.
+- `untrusted_input_policy` (object)
+  - The sanitization rules applied to free-text inputs (resume content, JD content, tool-returned text) before they enter an agent's context. See §15.
+
+#### 4.1.8 Match Dossier
+
+The proof-of-work artifact produced at run completion. The harness's primary output. Three consumers (human reviewer surfaces, audit log, downstream webhook/A2A emitters) read one canonical dossier; viewer-specific projections are derived at delivery time, not produced as separate dossiers.
+
+Fields:
+
+- `dossier_id` (string, UUID)
+- `match_ticket_id` (string, UUID)
+- `run_id` (string, UUID)
+- `version` (integer, `>=1`)
+  - Increments on re-negotiation. The (`match_ticket_id`, `version`) pair is unique.
+- `seeker_score` (object)
+  - `{dimensions: [{name, score, rationale}], weighted_total, rubric_ref}`. Per-dimension scores produced by the seeker-side agent against the seeker-side rubric; weighted total computed deterministically by the harness.
+- `employer_score` (object)
+  - Same shape for the employer side.
+- `transcript_canonical_ref` (string)
+  - Reference to the full unredacted transcript in the audit log. Direct content lives in the audit log, not on the dossier.
+- `transcript_projections` (map: audience -> transcript fragment)
+  - Pre-computed redaction projections for known audiences (seeker, employer, auditor, A2A receiver). Each projection is the result of applying the privacy ruleset at the corresponding audience's disclosure stage.
+- `agent_rationale` (object)
+  - `{seeker: string, employer: string}` — each side's one-paragraph rationale in the agent's own voice. Bounded length.
+- `flags` (list of strings)
+  - Normalized to lowercase. Surfaced for human attention. Examples: `comp_range_misaligned`, `visa_sponsorship_required`, `inconclusive_insufficient_data`.
+- `outcome` (string, enum: `complete` | `inconclusive`)
+  - `complete` MUST mean both sides produced full rubric scores. `inconclusive` MUST be paired with at least one flag explaining what would resolve it.
+- `version_metadata` (object)
+  - `{seeker_contract_ref, employer_contract_ref, privacy_ruleset_ref, harness_version, model_invocations: [{side, provider, model_id, version}]}`. The full set of versioned references needed to reconstruct the run.
+- `signature` (object, OPTIONAL)
+  - `{algorithm, signed_at, signer_key_id, signature_value}`. If dossier signing is enabled (§15), the signature covers all preceding fields.
+- `produced_at` (timestamp)
+
+#### 4.1.9 Audit Entry
+
+One append-only durable record in the audit log. Compliance-grade: tamper-evident under the implementation's audit retention policy.
+
+Fields:
+
+- `entry_id` (string, UUID)
+- `run_id` (string, UUID, or null)
+  - Null only for harness-level entries (e.g. config reload) not tied to a single run.
+- `match_ticket_id` (string, UUID, or null)
+- `kind` (string, enum)
+  - One of `run_dispatched`, `contract_resolved`, `state_transition`, `cross_side_projection`, `tool_call`, `tool_result`, `dossier_produced`, `run_terminated`, `harness_event`.
+- `payload` (object)
+  - Kind-specific structured payload. Free-text fields MUST be redacted per the privacy ruleset before persistence; the canonical unredacted transcript is held under separate retention controls referenced by `transcript_canonical_ref`.
+- `prev_entry_hash` (string or null)
+  - Implementation-defined hash chain; if implemented, each entry's hash MUST be computable from `prev_entry_hash` and the entry payload. Null for the first entry of a chain.
+- `recorded_at` (timestamp)
+
+#### 4.1.10 Coordinator Runtime State
+
+Single authoritative state owned by the negotiation coordinator for one run. Held inside the Inngest function's durable execution context; durability is provided by Inngest, not by the coordinator persisting it explicitly.
+
+Fields:
+
+- `run_id` (string, UUID)
+- `match_ticket_id` (string, UUID)
+- `current_round` (integer, `>=0`)
+- `round_cap` (integer)
+- `current_side` (string, enum: `seeker` | `employer` | `neither`)
+  - Whose turn it is in the current round. `neither` while transitioning between rounds.
+- `seeker_status` (string, enum)
+  - Per-side run status; see §7.
+- `employer_status` (string, enum)
+- `pending_tool_calls` (map `tool_call_id -> tool-call descriptor`)
+- `started_at` (timestamp)
 
 ### 4.2 Stable Identifiers and Normalization Rules
 
-- `Issue ID`
-  - Use for tracker lookups and internal map keys.
-- `Issue Identifier`
-  - Use for human-readable logs and workspace naming.
-- `Workspace Key`
-  - Derive from `issue.identifier` by replacing any character not in `[A-Za-z0-9._-]` with `_`.
-  - Use the sanitized value for the workspace directory name.
-- `Normalized Issue State`
-  - Compare states after `lowercase`.
-- `Session ID`
-  - Compose from coding-agent `thread_id` and `turn_id` as `<thread_id>-<turn_id>`.
+- `Match Ticket ID`
+  - Database UUID. Use for joins and audit-log keying.
+- `Match Ticket Identifier`
+  - Human-readable key. Use for operator surfaces and log lines.
+- `Run ID`
+  - UUID generated at run dispatch. New `run_id` per re-negotiation; the audit log keys against `run_id`, not match ticket identifier, so re-negotiations are distinguishable.
+- `Contract Ref`
+  - The pair `(contract_id, version)`. MUST resolve to one immutable definition for all time. Renaming an existing version is not permitted; produce a new version instead.
+- `Rubric Ref`
+  - Same immutability discipline as Contract Ref. Required because dossiers reference rubric versions for audit.
+- `Privacy Ruleset Ref`
+  - Same immutability discipline. The ruleset version applied to a run MUST be the version current at run dispatch, frozen for the run's duration.
+- `Audit Chain Position`
+  - The sequence position of an entry within its hash chain. Implementation-defined whether chains are global, per-run, or per-day partitioned; see §13.
+- `Normalized Match State`
+  - Compare states after `lowercase`. Run-state machine values defined in §7 are already lowercase.
 
 ## 5. Workflow Specification (Repository Contract)
 
