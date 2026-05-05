@@ -20,7 +20,7 @@
 
 - [ ] Spec changes are internally consistent — no broken §-references, no contradictions with adjacent sections.
 - [ ] If adding a normative requirement, the corresponding §17 test entry exists (and §18 entry, if it should gate production).
-- [ ] If touching JOBBOBBER_ADAPTATIONS.md, the rationale aligns with the SPEC.md text it points at.
+- [ ] If touching PARLEY_ADAPTATIONS.md, the rationale aligns with the SPEC.md text it points at.
 - [ ] <!-- Additional targeted checks (list below) -->
 
 <!-- This is a spec-and-docs repo. There is no build, no test runner, no CI lane beyond review. The bar is "the spec still reads cleanly and the cross-references resolve." -->

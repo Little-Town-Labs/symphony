@@ -1,34 +1,30 @@
-# JobBobber Harness Spec
+# Parley
 
-This repository is a fork of [openai/symphony](https://github.com/openai/symphony), adapted into the working specification for the **JobBobber agent harness**. It is a spec-and-docs repo: there is no runtime here, no service to deploy, and no code dependency to install. The deliverable is the spec itself.
+**Parley** is the negotiation agent harness for [JobBobber](https://github.com/Little-Town-Labs). It wraps each match-ticket negotiation between a seeker-side agent and an employer-side agent, mediates their cross-side communication through a privacy filter, and produces a versioned **match dossier** as the proof-of-work artifact for human review and audit.
 
-The fork is pinned to upstream commit [`58cf97d`](https://github.com/openai/symphony/commit/58cf97d) (`fix(elixir): configure Codex app-server model via config`) — the last upstream commit before this fork. We are not tracking upstream — Symphony's value to us is the harness *pattern*, captured once at this commit and adapted from there. OpenAI has stated they don't plan to maintain Symphony as a product, so re-evaluation against any future upstream change is a fresh research task rather than a continuous integration burden.
+This repository is the **Parley specification**. It is a spec-and-docs repo: no runtime, no service to deploy, no code dependency to install. The deliverable is `SPEC.md`.
 
-## What we kept and why
+This fork was originally adapted from [openai/symphony](https://github.com/openai/symphony) (pinned to commit [`58cf97d`](https://github.com/openai/symphony/commit/58cf97d)). Symphony's contribution was the **harness pattern** — the structured envelope around an autonomous agent that makes its output safe to launch, legible while running, and verifiable when complete. Parley adopts that pattern and adapts it for JobBobber's two-sided negotiation runs. We are not tracking upstream; OpenAI has stated they don't plan to maintain Symphony as a product.
 
-Symphony's contribution is the **harness pattern**: the structured envelope around an autonomous agent that makes its output safe to launch, legible while running, and verifiable when complete. That envelope has six elements that travel across domains — a versioned agent contract, a sandboxed execution context, a defined tool surface, an untrusted-input posture, a run-to-completion rule, and a proof-of-work artifact. Those are what we are adapting.
+## What Parley is for
 
-Everything else in Symphony — Linear as the control plane, the Codex App Server JSON-RPC protocol, the Elixir reference implementation, the polling scheduler — is a deployment choice we don't share. Those pieces have been removed from this fork. `SPEC.md` remains untouched in this pass and is the source material for the editorial transformation that follows.
+JobBobber is a two-sided AI hiring marketplace. Job seekers and employers each have an autonomous agent acting on their behalf. When a seeker ticket and an employer ticket meet, a match ticket is created — that's the trigger Parley listens for. Two agents conduct a structured, round-bounded negotiation through a privacy filter; each agent independently scores the fit against its own versioned rubric; the harness assembles a single canonical dossier with per-audience transcript projections, deterministic weighted totals, agent rationale, and full version metadata.
 
-## What this is for: JobBobber
-
-[JobBobber](https://github.com/Little-Town-Labs) is a two-sided AI hiring marketplace. Job seekers and employers each have an autonomous agent acting on their behalf. When a seeker ticket and an employer ticket meet, a **match ticket** is created and the two agents conduct a structured negotiation through a privacy filter. Each agent independently scores the fit against its own versioned rubric, and each side's human has a notification threshold.
-
-The harness specified in this repo is what wraps each negotiation run. It defines the agent contract, the execution context, the privacy-filter boundary, the run-to-completion rule, and the **match dossier** that serves as proof-of-work — scores with rubric breakdowns, redacted transcript, agent rationale, flags, and version metadata. Auditability against EEOC, NYC Local Law 144, and similar AI-hiring rules is a first-class requirement of the spec, not a future concern.
+Auditability under EEOC, NYC Local Law 144, and similar AI-hiring regulation is a first-class correctness requirement of Parley — not an observability nice-to-have. Compliance hooks (versioned rubrics with bias-test artifacts, hash-chained audit log, dossier signing in production posture) are normative in the spec, not optional.
 
 ## Repository contents
 
-- [`SPEC.md`](SPEC.md) — the upstream Symphony spec, preserved verbatim. The next editorial pass will transform this into the JobBobber harness spec.
-- [`JOBBOBBER_ADAPTATIONS.md`](JOBBOBBER_ADAPTATIONS.md) — companion doc to `SPEC.md` recording which Symphony patterns we're adopting, which we're explicitly not, and what's still open. The reasoning behind the pass-two transformation lives here.
-- [`LICENSE`](LICENSE) — Apache License 2.0, inherited from upstream.
+- [`SPEC.md`](SPEC.md) — the Parley specification. Eighteen normative sections covering the domain model, agent contract registry, run-state machine, Inngest event topology, privacy filter, side runner protocol, audit log, regulatory posture, and reference algorithms. This is the contract.
+- [`PARLEY_ADAPTATIONS.md`](PARLEY_ADAPTATIONS.md) — companion doc recording which Symphony patterns Parley adopted (and where each one landed in `SPEC.md`), which patterns were explicitly not adopted, and what remains genuinely open. Decisions-taken log, not a forward-looking plan.
+- [`LICENSE`](LICENSE) — Apache License 2.0, inherited from the upstream Symphony fork point.
 - [`NOTICE`](NOTICE) — upstream copyright notice, preserved as required by Apache 2.0.
 
 ## Attribution
 
-Originally forked from [openai/symphony](https://github.com/openai/symphony), pinned to commit [`58cf97d`](https://github.com/openai/symphony/commit/58cf97d). Symphony is © 2025 OpenAI, licensed under Apache 2.0. The original `LICENSE` and `NOTICE` files are preserved in this repository unchanged.
+Parley's specification originated as a fork of [openai/symphony](https://github.com/openai/symphony), pinned to commit [`58cf97d`](https://github.com/openai/symphony/commit/58cf97d). Symphony is © 2025 OpenAI, licensed under Apache 2.0. The original `LICENSE` and `NOTICE` files are preserved in this repository unchanged. Symphony's specification has been transformed section-by-section into Parley's; git history preserves the original.
 
-For background on the harness pattern this spec builds on, see OpenAI's [harness engineering post](https://openai.com/index/harness-engineering/) and the [Symphony announcement](https://openai.com/index/open-source-codex-orchestration-symphony/).
+For background on the harness pattern Parley builds on, see OpenAI's [harness engineering post](https://openai.com/index/harness-engineering/) and the [Symphony announcement](https://openai.com/index/open-source-codex-orchestration-symphony/).
 
 ## License
 
-This project is licensed under the [Apache License 2.0](LICENSE), inherited from the upstream Symphony project.
+This project is licensed under the [Apache License 2.0](LICENSE), inherited from Symphony.

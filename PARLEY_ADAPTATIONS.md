@@ -24,7 +24,7 @@ The original Elixir reference implementation is removed from this fork; it is in
 
 **Symphony pattern.** When an autonomous agent hands work back to a human, it attaches a structured bundle of evidence: CI status, PR review feedback, complexity analysis, walkthrough video. The human reviews the bundle, not the raw work.
 
-**JobBobber adaptation — landed.** Every match-ticket negotiation produces a versioned `MatchDossier` (`SPEC.md` §4.1.8) when the run reaches a terminal `complete` or `inconclusive` state. The dossier carries:
+**Parley adaptation — landed.** Every match-ticket negotiation produces a versioned `MatchDossier` (`SPEC.md` §4.1.8) when the run reaches a terminal `complete` or `inconclusive` state. The dossier carries:
 
 - Per-side, per-dimension rubric breakdowns with deterministic weighted totals
 - Per-audience redacted transcript projections (seeker, employer, auditor, A2A receiver), produced once and stored on the dossier rather than computed at delivery
@@ -44,7 +44,7 @@ Open questions resolved by the spec:
 
 **Symphony pattern.** Agents only do good work when the environment around them gives structured inputs, deterministic verifications, and clear contracts. Symphony's harness is the test suite, lint, CI, and `WORKFLOW.md`.
 
-**JobBobber adaptation — landed.** The scoring rubric is a versioned, structured artifact in its own registry (§4.1.6, §5.4). Concretely:
+**Parley adaptation — landed.** The scoring rubric is a versioned, structured artifact in its own registry (§4.1.6, §5.4). Concretely:
 
 - Rubrics live in a versioned registry; `(rubric_id, version)` is immutable for all time (§5.1).
 - Prompt templates MUST NOT embed dimension weights or scoring guidance. Rubric registry resolution and prompt rendering are separate paths (§5.4, §12.2).
@@ -63,7 +63,7 @@ Implementation notes still relevant:
 
 **Symphony pattern.** Agent instructions live in `WORKFLOW.md` inside the repo so the agent's behavior is versioned alongside the code it's modifying.
 
-**JobBobber adaptation — landed.** Symphony's `WORKFLOW.md` becomes the `AgentContract` (§4.1.2, §5). Contracts live in a durable versioned registry rather than a per-repo file. Each contract pins references to a versioned prompt template, a versioned rubric, a tool surface, model selection, and runtime settings. Every dossier records which `(contract_id, version)` produced it.
+**Parley adaptation — landed.** Symphony's `WORKFLOW.md` becomes the `AgentContract` (§4.1.2, §5). Contracts live in a durable versioned registry rather than a per-repo file. Each contract pins references to a versioned prompt template, a versioned rubric, a tool surface, model selection, and runtime settings. Every dossier records which `(contract_id, version)` produced it.
 
 The shift away from `WORKFLOW.md`-style files is deliberate: JobBobber has one product repo and a separate harness deployment, with no analog to "the repo the agent is modifying." The versioning benefit comes from registry immutability + dossier metadata, not from a per-repo file convention.
 
@@ -71,7 +71,7 @@ The shift away from `WORKFLOW.md`-style files is deliberate: JobBobber has one p
 
 **Symphony pattern.** Every implementation run is isolated — its own working directory, its own context, no state bleed between runs.
 
-**JobBobber adaptation — landed.** §9 codifies five isolation invariants:
+**Parley adaptation — landed.** §9 codifies five isolation invariants:
 
 1. Per-run isolation. Context storage MUST be keyed by `run_id`; storage keyed only by `principal_id` violates the invariant.
 2. Per-side isolation within a run. Seeker and employer contexts MUST NOT share storage.
@@ -85,7 +85,7 @@ Invariants 1, 2, 3 are pinned as production CI gates (§17.4, §18.2): cross-mat
 
 **Symphony pattern.** An autonomous run never blocks waiting for human input mid-execution. If the agent needs human input, the run fails and hands off; the run does not pause.
 
-**JobBobber adaptation — landed.** Run-to-completion is the harness contract (§7, §10.5):
+**Parley adaptation — landed.** Run-to-completion is the harness contract (§7, §10.5):
 
 - Agents MUST NOT pause for human input mid-negotiation.
 - Inability to score surfaces as an `inconclusive` dossier with flags describing what would resolve it (§4.1.8, §16.6) — not as a paused run.
@@ -99,7 +99,7 @@ The round cap (§7.2) bounds re-negotiation depth at the round level. The defaul
 
 **Symphony pattern.** Tracker data, repo contents, prompt inputs, and tool arguments cannot be assumed trustworthy just because they originate inside a normal workflow.
 
-**JobBobber adaptation — landed.** §15.1 enumerates the assumed-untrusted inputs (seeker resume text, employer JD/req text, ATS-imported content, tool-returned text, A2A-received content). The posture is enforced at three structural points:
+**Parley adaptation — landed.** §15.1 enumerates the assumed-untrusted inputs (seeker resume text, employer JD/req text, ATS-imported content, tool-returned text, A2A-received content). The posture is enforced at three structural points:
 
 - The privacy filter (§15.2) applies the ruleset's `untrusted_input_policy` deterministically before content reaches either side's view. Failing closed is mandatory.
 - Prompt construction wraps every untrusted free-text field with sentinels containing a per-run nonce (§12.4) so a malicious payload cannot forge a closing sentinel.
@@ -111,7 +111,7 @@ A sentinel-injection attack test (§17.6) is also in the production gate.
 
 **Symphony pattern.** Implementations may expose a limited set of optional tools to the agent. Supported tools are advertised on session startup. Unsupported tool requests return a graceful failure and the session continues.
 
-**JobBobber adaptation — landed.** The contract's `tool_surface` (§4.1.2, §5.5) is the per-run versioned advertisement of available tools. Each descriptor carries `(name, version, input_schema, output_schema, disclosure_class)`. New tools added to the catalog don't break older active runs — runs only see tools their contract version pinned (§5.5). Unsupported tool calls return `tool_unsupported` and the turn continues (§10.3).
+**Parley adaptation — landed.** The contract's `tool_surface` (§4.1.2, §5.5) is the per-run versioned advertisement of available tools. Each descriptor carries `(name, version, input_schema, output_schema, disclosure_class)`. New tools added to the catalog don't break older active runs — runs only see tools their contract version pinned (§5.5). Unsupported tool calls return `tool_unsupported` and the turn continues (§10.3).
 
 The `disclosure_class` field — `principal_self`, `counterparty_filtered`, `platform_open` — is JobBobber-specific and routes tool outputs through the privacy filter when appropriate (§9.4, §10.3). The harness tool dispatcher is the only path that invokes tools; direct tRPC/SDK calls from side-runner code are rejected at type-check (§10.3, §17.5). Disclosure-class enforcement for `counterparty_filtered` outputs is in the production CI gate (§17.5, §18.2).
 
@@ -119,7 +119,7 @@ The `disclosure_class` field — `principal_self`, `counterparty_filtered`, `pla
 
 **Linear-as-control-plane.** Symphony reads from an external issue tracker because the engineering team already lives in Linear. JobBobber's match tickets are first-class entities in the JobBobber Postgres database. The `MatchTicketReader` (§3.1, §11) reads from there directly.
 
-**Polling-based scheduler.** Symphony watches the board and spawns runs when tickets are ready. JobBobber's harness is event-driven through Inngest (§8). Six Inngest functions handle dispatch, coordination, per-side runs, privacy filtering, dossier production, and run invalidation. No polling loop.
+**Polling-based scheduler.** Symphony watches the board and spawns runs when tickets are ready. Parley is event-driven through Inngest (§8). Six Inngest functions handle dispatch, coordination, per-side runs, privacy filtering, dossier production, and run invalidation. No polling loop.
 
 **Codex App Server / JSON-RPC protocol.** Codex-specific. JobBobber uses Anthropic and OpenAI through the Vercel AI Gateway (§10). Side runners drive model sessions through the gateway, not through a stdio app-server.
 
@@ -127,13 +127,13 @@ The `disclosure_class` field — `principal_self`, `counterparty_filtered`, `pla
 
 **`WORKFLOW.md` as a per-repo file.** Replaced by the versioned contract registry (§5.1). The versioning benefit comes from registry immutability + dossier metadata, not from a per-repo file convention.
 
-**Hot-reload of policy files.** Symphony supports dynamic `WORKFLOW.md` reload. JobBobber deliberately does not (§6.2): harness config is frozen per deployment, and a run dispatched under one config completes under that config. Policy iteration happens in the contract/rubric registries, which already support fast iteration without touching harness config.
+**Hot-reload of policy files.** Symphony supports dynamic `WORKFLOW.md` reload. Parley deliberately does not (§6.2): harness config is frozen per deployment, and a run dispatched under one config completes under that config. Policy iteration happens in the contract/rubric registries, which already support fast iteration without touching harness config.
 
-**Filesystem workspaces.** Symphony's per-issue workspace becomes JobBobber's per-side, in-memory `NegotiationContext` (§4.1.5, §9). The harness owns no filesystem state per run; durability comes from the audit log and dossier persistence, not from disk-backed workspaces. This eliminated Symphony's path-safety invariants and replaced them with the §9.5 isolation invariants.
+**Filesystem workspaces.** Symphony's per-issue workspace becomes Parley's per-side, in-memory `NegotiationContext` (§4.1.5, §9). The harness owns no filesystem state per run; durability comes from the audit log and dossier persistence, not from disk-backed workspaces. This eliminated Symphony's path-safety invariants and replaced them with the §9.5 isolation invariants.
 
-**The "ask Codex to implement Symphony" build path.** Generating a TypeScript port of Symphony would give us a working Symphony, not a JobBobber. We're already a system that happens to share some patterns; building a literal port creates something we don't need and would have to maintain separately.
+**The "ask Codex to implement Symphony" build path.** Generating a TypeScript port of Symphony would give us a working Symphony, not Parley. We're already a system that happens to share some patterns; building a literal port creates something we don't need and would have to maintain separately.
 
-**Symphony's HTTP dashboard / runtime status endpoint.** The operator status surface for JobBobber is the JobBobber product UI consuming the audit log and `dossier.produced` events (§13.7). Embedding an HTTP server in the harness layer is unnecessary; the operator API (§13.8) is OPTIONAL and authentication-required, not a public dashboard.
+**Symphony's HTTP dashboard / runtime status endpoint.** Parley's operator status surface is the JobBobber product UI consuming the audit log and `dossier.produced` events (§13.7). Embedding an HTTP server in the harness layer is unnecessary; the operator API (§13.8) is OPTIONAL and authentication-required, not a public dashboard.
 
 **Symphony's SSH worker extension.** Removed. Vercel/Inngest is the execution substrate; remote-host execution is not a deployment shape JobBobber will use.
 
@@ -154,7 +154,7 @@ Items the spec does not pin and that need product/design work or empirical valid
 
 This doc is written against Symphony at commit `58cf97d` (`fix(elixir): configure Codex app-server model via config`) — the last upstream commit before this fork, and the version of `SPEC.md` originally preserved in this repo before pass-two transformation. The harness patterns originated in Symphony's initial public release (`b0e0ff0`) and were unchanged through `58cf97d`; the later commit only refined spec prose (RFC 2119 normative language, tightened "may" vs "MUST" wording) without altering the pattern set.
 
-`SPEC.md` in this repo is no longer the upstream Symphony text. It is the JobBobber Agent Harness Specification, transformed section-by-section from Symphony's structure to JobBobber's contract. Git history preserves the original.
+`SPEC.md` in this repo is no longer the upstream Symphony text. It is the Parley specification — JobBobber's negotiation agent harness — transformed section-by-section from Symphony's structure. Git history preserves the original.
 
 OpenAI has stated they don't plan to maintain Symphony as a product, so we're not tracking upstream. If a major Symphony update worth re-evaluating ever lands, that's a fresh research task, not a continuous integration burden.
 

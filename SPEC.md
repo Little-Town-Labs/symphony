@@ -1,10 +1,12 @@
-# JobBobber Agent Harness Specification
+# Parley: JobBobber's Negotiation Agent Harness Specification
 
-Status: Draft v1. Target runtime is TypeScript on Inngest / Next.js / Postgres (Vercel); the harness patterns described here are stack-agnostic, but normative requirements are written against that target.
+Status: Draft v1. Target runtime is TypeScript on Inngest / Next.js / Postgres (Vercel); Parley's patterns are stack-agnostic, but normative requirements are written against that target.
 
-Purpose: Define the harness that wraps each JobBobber match-ticket negotiation — the structured envelope around two autonomous agents that makes their joint output safe to launch, legible while running, verifiable when complete, and defensible under AI-hiring regulation.
+Purpose: Define **Parley**, the harness that wraps each JobBobber match-ticket negotiation — the structured envelope around two autonomous agents that makes their joint output safe to launch, legible while running, verifiable when complete, and defensible under AI-hiring regulation.
 
-> This document is forked from the Symphony coding-agent specification (`openai/symphony`, commit `58cf97d`, Apache 2.0). Symphony's contribution is the harness pattern: versioned agent contract, sandboxed execution context, defined tool surface, untrusted-input posture, run-to-completion rule, and proof-of-work artifact. Those six elements are preserved here. Symphony's deployment choices — Linear as control plane, Codex App Server protocol, polling scheduler, Elixir runtime — are replaced with JobBobber's: first-class match tickets in Postgres, Anthropic/OpenAI via Vercel AI Gateway, Inngest event-driven execution. See [`JOBBOBBER_ADAPTATIONS.md`](JOBBOBBER_ADAPTATIONS.md) for the section-by-section reasoning.
+The name **Parley** denotes both the harness itself and one execution of it: "Parley is the harness around JobBobber's negotiations" and "a Parley run" are both standard usage. Throughout this document, "Parley" is the proper noun for the harness; "the harness" is its generic-noun synonym used where the proper-noun form would read awkwardly. The two are interchangeable.
+
+> This document is forked from the Symphony coding-agent specification (`openai/symphony`, commit `58cf97d`, Apache 2.0). Symphony's contribution is the harness pattern: versioned agent contract, sandboxed execution context, defined tool surface, untrusted-input posture, run-to-completion rule, and proof-of-work artifact. Those six elements are preserved in Parley. Symphony's deployment choices — Linear as control plane, Codex App Server protocol, polling scheduler, Elixir runtime — are replaced with JobBobber's: first-class match tickets in Postgres, Anthropic/OpenAI via Vercel AI Gateway, Inngest event-driven execution. See [`PARLEY_ADAPTATIONS.md`](PARLEY_ADAPTATIONS.md) for the section-by-section reasoning.
 
 ## Normative Language
 
@@ -17,7 +19,7 @@ behavior.
 
 ## 1. Problem Statement
 
-The JobBobber harness is the runtime envelope around a single **match-ticket negotiation run**. When a seeker ticket and an employer ticket meet, a match ticket is created and two autonomous agents — one acting on behalf of each side's principal — conduct a structured negotiation through a privacy filter. Each agent independently scores the fit against its own versioned rubric. The harness wraps that joint execution and produces a **match dossier** as the proof-of-work artifact for human review and audit.
+Parley is the runtime envelope around a single **match-ticket negotiation run**. When a seeker ticket and an employer ticket meet, a match ticket is created and two autonomous agents — one acting on behalf of each side's principal — conduct a structured negotiation through a privacy filter. Each agent independently scores the fit against its own versioned rubric. The harness wraps that joint execution and produces a **match dossier** as the proof-of-work artifact for human review and audit.
 
 The harness solves five operational problems:
 
@@ -395,7 +397,7 @@ Fields:
 
 ## 5. Agent Contract Specification (Versioned Policy)
 
-The agent contract is the JobBobber harness's analog of Symphony's `WORKFLOW.md`. It is the versioned, structured definition of one side's agent behavior for one run: prompt template, scoring rubric reference, tool surface, model selection, runtime settings. Two contracts (one seeker, one employer) are loaded per run and frozen for the run's duration.
+The agent contract is Parley's analog of Symphony's `WORKFLOW.md`. It is the versioned, structured definition of one side's agent behavior for one run: prompt template, scoring rubric reference, tool surface, model selection, runtime settings. Two contracts (one seeker, one employer) are loaded per run and frozen for the run's duration.
 
 This section defines the contract storage, identification, validation, and rendering rules. The actual content of any specific contract version (the dimension list of a rubric, the body of a prompt template) is product/policy artifact, not part of this specification.
 
@@ -582,7 +584,7 @@ Required behavior:
 - Deployment-time config changes take effect on subsequent process starts. In-flight runs continue under their original harness version until completion.
 - The harness MUST emit a `harness_config_loaded` audit entry at startup with a content-addressed hash of the resolved config.
 
-This is a deliberate departure from Symphony, which supports dynamic workflow reload. In Symphony, the `WORKFLOW.md` is the policy artifact and operators want fast iteration; in JobBobber the policy artifact is the versioned contract registry, which already supports rapid iteration without touching harness config.
+This is a deliberate departure from Symphony, which supports dynamic workflow reload. In Symphony, the `WORKFLOW.md` is the policy artifact and operators want fast iteration; in Parley the policy artifact is the versioned contract registry, which already supports rapid iteration without touching harness config.
 
 ### 6.3 Dispatch Preflight Validation
 
@@ -763,7 +765,7 @@ Terminal states:
 
 ## 8. Event Dispatch and Inngest Topology
 
-JobBobber's harness is event-driven, not polling-based. Inngest is the durable executor; this section defines the events, the functions that consume them, the concurrency and idempotency rules, and the recovery semantics. Symphony's polling loop, candidate selection, and reconciliation tick are replaced by event-triggered Inngest functions.
+Parley is event-driven, not polling-based. Inngest is the durable executor; this section defines the events, the functions that consume them, the concurrency and idempotency rules, and the recovery semantics. Symphony's polling loop, candidate selection, and reconciliation tick are replaced by event-triggered Inngest functions.
 
 ### 8.1 Event Topology
 
@@ -884,7 +886,7 @@ There is no per-match-ticket workspace to clean up: the harness owns no filesyst
 
 ## 9. Negotiation Context Management and Isolation Invariants
 
-JobBobber's harness owns no filesystem state per run. Symphony's per-issue workspace becomes the per-side **negotiation context** (§4.1.5): an in-memory data structure held inside the Inngest function execution that owns it. This section defines context lifecycle, the isolation invariants that prevent prompt-injection cross-contamination, and the contract for any tool-extended state.
+Parley owns no filesystem state per run. Symphony's per-issue workspace becomes the per-side **negotiation context** (§4.1.5): an in-memory data structure held inside the Inngest function execution that owns it. This section defines context lifecycle, the isolation invariants that prevent prompt-injection cross-contamination, and the contract for any tool-extended state.
 
 ### 9.1 Context Layout
 
@@ -1062,7 +1064,7 @@ Run-to-completion is the harness contract (§7). The runner MUST NOT introduce m
 Required posture:
 
 - The runner MUST NOT advertise any tool whose semantics include "ask the principal" or "wait for human confirmation". Tools that need human input are a category error in this harness; they belong outside the run.
-- If the model attempts to invoke an unsupported tool, the runner returns the structured `tool_unsupported` result and continues the turn (§10.3). This naturally absorbs cases where a model has been trained on human-in-the-loop tools that JobBobber's contract does not expose.
+- If the model attempts to invoke an unsupported tool, the runner returns the structured `tool_unsupported` result and continues the turn (§10.3). This naturally absorbs cases where a model has been trained on human-in-the-loop tools that Parley's contract does not expose.
 - If the model's output indicates it needs information not available through the contract's tool surface, the runner treats this as the model's signal to either (a) emit `done_signal: true` if it has enough to score, (b) propose a flag describing what would resolve the gap, or (c) continue the turn with what it has. The runner does NOT pause for human input.
 
 Scoring-phase tool surface:
@@ -1278,7 +1280,7 @@ If prompt assembly fails:
 
 ## 13. Audit Log, Operator Logs, and Observability
 
-JobBobber's harness has two distinct observability surfaces with different durability and retention semantics. Conflating them is a compliance defect.
+Parley has two distinct observability surfaces with different durability and retention semantics. Conflating them is a compliance defect.
 
 - The **audit log** (§13.1–§13.4) is the compliance-grade durable record. It is what an EEOC investigator, a Local Law 144 auditor, or an internal incident reviewer reads. Append-only, retention-bounded by regulation, optionally hash-chained, and authoritative for "what did the harness actually do."
 - The **operator logs** (§13.5) are volatile structured logs for live debugging and operational alerting. Lower retention, lossy under sink failure, and explicitly NOT a compliance artifact.
@@ -1287,7 +1289,7 @@ The canonical (unredacted) transcript store (§13.3) is a third surface, structu
 
 ### 13.1 Audit Log Requirements
 
-The audit log is the durable record of every harness decision. It is the consequence of JobBobber's first-class auditability requirement (§1) and is non-optional in production posture.
+The audit log is the durable record of every Parley decision. It is the consequence of JobBobber's first-class auditability requirement (§1) and is non-optional in production posture.
 
 Required properties:
 
@@ -1558,7 +1560,7 @@ Verification:
 
 ### 15.5 Regulatory Posture
 
-JobBobber's harness is an automated employment decision tool under several active regulatory regimes. The harness MUST support compliance posture, but specific regulatory determinations remain product/legal artifacts referenced from the harness, not encoded into it.
+Parley is an automated employment decision tool under several active regulatory regimes. The harness MUST support compliance posture, but specific regulatory determinations remain product/legal artifacts referenced from the harness, not encoded into it.
 
 Required regulatory hooks:
 
