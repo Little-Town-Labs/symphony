@@ -1276,674 +1276,661 @@ If prompt assembly fails:
 - Untrusted-wrapping errors → `untrusted_wrap_error`. Hard failure; the run MUST NOT proceed with unwrapped untrusted text.
 - Failures fail the affected turn. The coordinator decides whether to retry the turn or escalate per §7.3. Repeated assembly failures within a single turn collapse to `tool_failure` after the retry budget exhausts.
 
-## 13. Logging, Status, and Observability
+## 13. Audit Log, Operator Logs, and Observability
 
-### 13.1 Logging Conventions
+JobBobber's harness has two distinct observability surfaces with different durability and retention semantics. Conflating them is a compliance defect.
 
-REQUIRED context fields for issue-related logs:
+- The **audit log** (§13.1–§13.4) is the compliance-grade durable record. It is what an EEOC investigator, a Local Law 144 auditor, or an internal incident reviewer reads. Append-only, retention-bounded by regulation, optionally hash-chained, and authoritative for "what did the harness actually do."
+- The **operator logs** (§13.5) are volatile structured logs for live debugging and operational alerting. Lower retention, lossy under sink failure, and explicitly NOT a compliance artifact.
 
-- `issue_id`
-- `issue_identifier`
+The canonical (unredacted) transcript store (§13.3) is a third surface, structurally separate from both, with the strictest access controls.
 
-REQUIRED context for coding-agent session lifecycle logs:
+### 13.1 Audit Log Requirements
 
-- `session_id`
+The audit log is the durable record of every harness decision. It is the consequence of JobBobber's first-class auditability requirement (§1) and is non-optional in production posture.
 
-Message formatting requirements:
+Required properties:
 
-- Use stable `key=value` phrasing.
+- **Append-only.** No update, no delete. Mutations are correctness defects.
+- **Durable.** Persisted via Postgres or an equivalent storage class with at least the durability guarantees of the match-ticket store. Audit-write retry budget is `audit_write_max_retries` (§8.4); exhaustion terminates the run rather than dropping the entry.
+- **Tamper-evident in production.** When `audit.hash_chain_enabled` is true (§6.4 default in production), each entry's `prev_entry_hash` chains to the prior entry per the configured `audit.partition_strategy`. A chain divergence is a critical alert and an audit-quality signal.
+- **Retained per the configured retention class.** `audit.retention_class` (§6.4) drives storage tier and minimum retention duration; specific durations are policy artifacts referenced from the harness, not hard-coded here.
+- **Queryable for run reconstruction.** Given a `run_id`, the harness MUST be able to enumerate every audit entry for that run in chronological order. Given a `match_ticket_id`, the harness MUST be able to enumerate every run and reconstruct the negotiation history including re-negotiations.
+
+### 13.2 Audit Entry Kinds
+
+The schema is defined in §4.1.9 (`AuditEntry`). The kinds and the minimum payload fields per kind are normative; implementations MAY add fields but MUST NOT remove the required ones.
+
+- `harness_event:harness_config_loaded`
+  - Payload: `{harness_version, environment, config_hash}`. Emitted at process start (§6.2).
+
+- `run_dispatched`
+  - Payload: `{run_id, match_ticket_id, attempt, seeker_contract_ref, employer_contract_ref, privacy_ruleset_ref, dispatched_by_event}`.
+
+- `contract_resolved`
+  - Payload: `{run_id, side, contract_ref, prompt_template_ref, rubric_ref, model, runtime_settings_resolved, runtime_settings_clamped}`. The `*_clamped` field records any §5.6 clamping.
+
+- `state_transition`
+  - Payload: `{run_id, from_state, to_state, transition_trigger, round}`. One entry per §7.3 transition.
+
+- `cross_side_projection`
+  - Payload: `{run_id, direction, ruleset_ref, disclosure_stage, source_hash, projected_hash, transcript_canonical_ref}`. Hashes only; full content lives in the canonical transcript store (§13.3).
+
+- `tool_call`
+  - Payload: `{run_id, side, tool_name, tool_version, args_redacted_hash, disclosure_class, tool_call_id, started_at}`.
+
+- `tool_result`
+  - Payload: `{run_id, side, tool_call_id, status, output_validated, completed_at, error_category}`. `args_redacted_hash` and the redacted args themselves are recorded in the canonical transcript store, not the audit entry payload, to keep audit entries small enough for efficient indexing.
+
+- `dossier_produced`
+  - Payload: `{run_id, dossier_id, dossier_version, outcome, signature_present, version_metadata_hash}`.
+
+- `run_terminated`
+  - Payload: `{run_id, terminal_state, termination_reason, dossier_id_or_null}`.
+
+- `harness_event:harness_version_drift`
+  - Payload: `{run_id, dispatched_harness_version, recovering_harness_version}`. Warning, not blocking (§7.4).
+
+- `harness_event:audit_step_divergence`
+  - Payload: `{run_id, expected_step_position, observed_step_position}`. Critical (§8.5C).
+
+Payload redaction:
+
+- Free-text fields with potential principal data MUST be redacted from audit entry payloads. The canonical transcript store (§13.3) holds unredacted content; audit entries reference it by `transcript_canonical_ref`.
+- The redaction policy applied to audit-entry payloads is implementation-defined but MUST be documented and MUST NOT be the empty policy.
+
+### 13.3 Canonical Transcript Store
+
+The canonical transcript store holds the full unredacted content the audit log references via hash and `transcript_canonical_ref`.
+
+Required properties:
+
+- **Separate retention controls.** Access is more restricted than the audit log itself; specific access policies are implementation-defined per the deployment's regulatory posture.
+- **Content-addressable.** Each entry is identifiable by a content hash so audit-log references remain valid under storage migration.
+- **Aligned lifecycle with the audit log.** When an audit entry's retention expires, its referenced transcript content is also subject to expiry. Implementations MAY use a longer transcript retention than audit retention, but never shorter — the audit entry MUST NOT outlive its referenced content.
+
+Content stored:
+
+- Full unredacted negotiation messages (per side, per round).
+- Full tool-call inputs and outputs (after `output_schema` validation).
+- Full prompt assemblies (so any audit reconstruction can replay the exact prompt the model received).
+
+### 13.4 Audit Quality Signals
+
+The harness MUST self-monitor and surface signals when audit quality degrades:
+
+- `audit_chain_divergence` — hash chain mismatch detected on read.
+- `audit_write_retry_exhausted` — audit write failed despite retry budget; run is terminated as `tool_failure`.
+- `audit_orphan_reference` — an audit entry references a transcript hash not present in the store.
+- `audit_step_divergence` — coordinator step replay disagrees with audit log (§8.5C).
+
+Each signal MUST be alerted to operators in real time AND recorded as a `harness_event` audit entry.
+
+### 13.5 Operator Logs
+
+Volatile structured logs for live debugging. Distinct from the audit log; operator logs MAY be lossy under sink failure.
+
+REQUIRED context fields:
+
+- `run_id` for any log line associated with a run.
+- `match_ticket_identifier` for human-readability in operator surfaces.
+- `harness_version` for version-correlation across deploys.
+- `inngest_function_name` and `inngest_step_name` where applicable.
+
+Formatting requirements:
+
+- Structured (JSON or `key=value`) emission. Plain prose log lines are not conforming.
 - Include action outcome (`completed`, `failed`, `retrying`, etc.).
-- Include concise failure reason when present.
-- Avoid logging large raw payloads unless necessary.
+- Include error category (matching one of §10.6 or §11.4 categories) when failures occur.
+- Avoid logging unredacted free-text payloads. Operator logs are NOT a substitute for the canonical transcript store.
 
-### 13.2 Logging Outputs and Sinks
+Sinks:
 
-The spec does not prescribe where logs are written (stderr, file, remote sink, etc.).
+- Implementations MAY write to one or more sinks. Vercel platform logs and Inngest's own log surface are conforming defaults.
+- Sink failure MUST NOT block harness operation. Sink-failure events SHOULD themselves be emitted to remaining sinks.
 
-Requirements:
+### 13.6 Metrics
 
-- Operators MUST be able to see startup/validation/dispatch failures without attaching a debugger.
-- Implementations MAY write to one or more sinks.
-- If a configured log sink fails, the service SHOULD continue running when possible and emit an
-  operator-visible warning through any remaining sink.
+The harness MUST emit, at minimum, these metrics for operational monitoring:
 
-### 13.3 Runtime Snapshot / Monitoring Interface (OPTIONAL but RECOMMENDED)
+- `runs_dispatched_total` (counter) — by `harness_environment`, `attempt_kind` (`first` | `renegotiation`).
+- `runs_terminated_total` (counter) — by `terminal_state`, `termination_reason`.
+- `dossier_produced_total` (counter) — by `outcome` (`complete` | `inconclusive`).
+- `run_duration_seconds` (histogram) — wall-clock from `pending` to terminal.
+- `round_count_per_run` (histogram).
+- `model_tokens_per_run` (histogram, summed across both sides).
+- `tool_call_count_per_run` (histogram).
+- `audit_write_failures_total` (counter).
+- `audit_chain_divergence_total` (counter) — non-zero is a critical alert.
+- `concurrent_runs_active` (gauge).
 
-If the implementation exposes a synchronous runtime snapshot (for dashboards or monitoring), it
-SHOULD return:
+Token accounting:
 
-- `running` (list of running session rows)
-- each running row SHOULD include `turn_count`
-- `retrying` (list of retry queue rows)
-- `codex_totals`
-  - `input_tokens`
-  - `output_tokens`
-  - `total_tokens`
-  - `seconds_running` (aggregate runtime seconds as of snapshot time, including active sessions)
-- `rate_limits` (latest coding-agent rate limit payload, if available)
+- Token counts are read from gateway response payloads at turn completion. Per-turn input/output/total counts accumulate at the run level and are recorded on the dossier's `version_metadata.model_invocations`.
+- Provider-specific delta vs. cumulative semantics MUST be normalized at the gateway adapter boundary; the harness sees only normalized cumulative-per-turn counters.
 
-RECOMMENDED snapshot error modes:
+### 13.7 Operator Status Surface
 
-- `timeout`
-- `unavailable`
+A human-readable operator status surface (admin console run-list, in-flight detail view, dossier outcome dashboard) is OPTIONAL at the harness layer and is owned by the JobBobber product UI.
 
-### 13.4 OPTIONAL Human-Readable Status Surface
+If a status surface is implemented:
 
-A human-readable status surface (terminal output, dashboard, etc.) is OPTIONAL and
-implementation-defined.
+- It MUST consume the audit log and metrics; it MUST NOT have its own state-mutation paths into the harness. Operator interventions (e.g. forcing run termination) belong on a separate operator API (§13.8) with explicit auditing of operator actions.
+- It MUST NOT be REQUIRED for harness correctness; the harness operates fully without it.
 
-If present, it SHOULD draw from orchestrator state/metrics only and MUST NOT be REQUIRED for
-correctness.
+### 13.8 Operator API (OPTIONAL)
 
-### 13.5 Session Metrics and Token Accounting
+If an operator API is implemented:
 
-Token accounting rules:
-
-- Agent events can include token counts in multiple payload shapes.
-- Prefer absolute thread totals when available, such as:
-  - `thread/tokenUsage/updated` payloads
-  - `total_token_usage` within token-count wrapper events
-- Ignore delta-style payloads such as `last_token_usage` for dashboard/API totals.
-- Extract input/output/total token counts leniently from common field names within the selected
-  payload.
-- For absolute totals, track deltas relative to last reported totals to avoid double-counting.
-- Do not treat generic `usage` maps as cumulative totals unless the event type defines them that
-  way.
-- Accumulate aggregate totals in orchestrator state.
-
-Runtime accounting:
-
-- Runtime SHOULD be reported as a live aggregate at snapshot/render time.
-- Implementations MAY maintain a cumulative counter for ended sessions and add active-session
-  elapsed time derived from `running` entries (for example `started_at`) when producing a
-  snapshot/status view.
-- Add run duration seconds to the cumulative ended-session runtime when a session ends (normal exit
-  or cancellation/termination).
-- Continuous background ticking of runtime totals is not REQUIRED.
-
-Rate-limit tracking:
-
-- Track the latest rate-limit payload seen in any agent update.
-- Any human-readable presentation of rate-limit data is implementation-defined.
-
-### 13.6 Humanized Agent Event Summaries (OPTIONAL)
-
-Humanized summaries of raw agent protocol events are OPTIONAL.
-
-If implemented:
-
-- Treat them as observability-only output.
-- Do not make orchestrator logic depend on humanized strings.
-
-### 13.7 OPTIONAL HTTP Server Extension
-
-This section defines an OPTIONAL HTTP interface for observability and operational control.
-
-If implemented:
-
-- The HTTP server is an extension and is not REQUIRED for conformance.
-- The implementation MAY serve server-rendered HTML or a client-side application for the dashboard.
-- The dashboard/API MUST be observability/control surfaces only and MUST NOT become REQUIRED for
-  orchestrator correctness.
-
-Extension config:
-
-- `server.port` (integer, OPTIONAL)
-  - Enables the HTTP server extension.
-  - `0` requests an ephemeral port for local development and tests.
-  - CLI `--port` overrides `server.port` when both are present.
-
-Enablement (extension):
-
-- Start the HTTP server when a CLI `--port` argument is provided.
-- Start the HTTP server when `server.port` is present in `WORKFLOW.md` front matter.
-- The `server` top-level key is owned by this extension.
-- Positive `server.port` values bind that port.
-- Implementations SHOULD bind loopback by default (`127.0.0.1` or host equivalent) unless explicitly
-  configured otherwise.
-- Changes to HTTP listener settings (for example `server.port`) do not need to hot-rebind;
-  restart-required behavior is conformant.
-
-#### 13.7.1 Human-Readable Dashboard (`/`)
-
-- Host a human-readable dashboard at `/`.
-- The returned document SHOULD depict the current state of the system (for example active sessions,
-  retry delays, token consumption, runtime totals, recent events, and health/error indicators).
-- It is up to the implementation whether this is server-generated HTML or a client-side app that
-  consumes the JSON API below.
-
-#### 13.7.2 JSON REST API (`/api/v1/*`)
-
-Provide a JSON REST API under `/api/v1/*` for current runtime state and operational debugging.
-
-Minimum endpoints:
-
-- `GET /api/v1/state`
-  - Returns a summary view of the current system state (running sessions, retry queue/delays,
-    aggregate token/runtime totals, latest rate limits, and any additional tracked summary fields).
-  - Suggested response shape:
-
-    ```json
-    {
-      "generated_at": "2026-02-24T20:15:30Z",
-      "counts": {
-        "running": 2,
-        "retrying": 1
-      },
-      "running": [
-        {
-          "issue_id": "abc123",
-          "issue_identifier": "MT-649",
-          "state": "In Progress",
-          "session_id": "thread-1-turn-1",
-          "turn_count": 7,
-          "last_event": "turn_completed",
-          "last_message": "",
-          "started_at": "2026-02-24T20:10:12Z",
-          "last_event_at": "2026-02-24T20:14:59Z",
-          "tokens": {
-            "input_tokens": 1200,
-            "output_tokens": 800,
-            "total_tokens": 2000
-          }
-        }
-      ],
-      "retrying": [
-        {
-          "issue_id": "def456",
-          "issue_identifier": "MT-650",
-          "attempt": 3,
-          "due_at": "2026-02-24T20:16:00Z",
-          "error": "no available orchestrator slots"
-        }
-      ],
-      "codex_totals": {
-        "input_tokens": 5000,
-        "output_tokens": 2400,
-        "total_tokens": 7400,
-        "seconds_running": 1834.2
-      },
-      "rate_limits": null
-    }
-    ```
-
-- `GET /api/v1/<issue_identifier>`
-  - Returns issue-specific runtime/debug details for the identified issue, including any information
-    the implementation tracks that is useful for debugging.
-  - Suggested response shape:
-
-    ```json
-    {
-      "issue_identifier": "MT-649",
-      "issue_id": "abc123",
-      "status": "running",
-      "workspace": {
-        "path": "/tmp/symphony_workspaces/MT-649"
-      },
-      "attempts": {
-        "restart_count": 1,
-        "current_retry_attempt": 2
-      },
-      "running": {
-        "session_id": "thread-1-turn-1",
-        "turn_count": 7,
-        "state": "In Progress",
-        "started_at": "2026-02-24T20:10:12Z",
-        "last_event": "notification",
-        "last_message": "Working on tests",
-        "last_event_at": "2026-02-24T20:14:59Z",
-        "tokens": {
-          "input_tokens": 1200,
-          "output_tokens": 800,
-          "total_tokens": 2000
-        }
-      },
-      "retry": null,
-      "logs": {
-        "codex_session_logs": [
-          {
-            "label": "latest",
-            "path": "/var/log/symphony/codex/MT-649/latest.log",
-            "url": null
-          }
-        ]
-      },
-      "recent_events": [
-        {
-          "at": "2026-02-24T20:14:59Z",
-          "event": "notification",
-          "message": "Working on tests"
-        }
-      ],
-      "last_error": null,
-      "tracked": {}
-    }
-    ```
-
-  - If the issue is unknown to the current in-memory state, return `404` with an error response (for
-    example `{\"error\":{\"code\":\"issue_not_found\",\"message\":\"...\"}}`).
-
-- `POST /api/v1/refresh`
-  - Queues an immediate tracker poll + reconciliation cycle (best-effort trigger; implementations
-    MAY coalesce repeated requests).
-  - Suggested request body: empty body or `{}`.
-  - Suggested response (`202 Accepted`) shape:
-
-    ```json
-    {
-      "queued": true,
-      "coalesced": false,
-      "requested_at": "2026-02-24T20:15:30Z",
-      "operations": ["poll", "reconcile"]
-    }
-    ```
-
-API design notes:
-
-- The JSON shapes above are the RECOMMENDED baseline for interoperability and debugging ergonomics.
-- Implementations MAY add fields, but SHOULD avoid breaking existing fields within a version.
-- Endpoints SHOULD be read-only except for operational triggers like `/refresh`.
-- Unsupported methods on defined routes SHOULD return `405 Method Not Allowed`.
-- API errors SHOULD use a JSON envelope such as `{"error":{"code":"...","message":"..."}}`.
-- If the dashboard is a client-side app, it SHOULD consume this API rather than duplicating state
-  logic.
+- Authentication and authorization are implementation-defined but MUST be required (no anonymous access).
+- All operator-triggered actions (force-terminate run, replay audit entry, requeue dossier emission) MUST themselves emit audit entries with `harness_event:operator_action` and `{operator_id, action, target_run_id}` payloads.
+- The operator API MUST NOT expose paths that bypass the run-state machine (§7) or the audit log.
 
 ## 14. Failure Model and Recovery Strategy
 
+The harness's failure-model surface is shaped by three earlier decisions: run-to-completion (§7), Inngest as durable executor (§8), and audit-grade durability (§13). This section consolidates the failure classes and points to the controlling sections rather than restating their semantics.
+
 ### 14.1 Failure Classes
 
-1. `Workflow/Config Failures`
-   - Missing `WORKFLOW.md`
-   - Invalid YAML front matter
-   - Unsupported tracker kind or missing tracker credentials/project slug
-   - Missing coding-agent executable
+1. **Registry resolution failures.**
+   - Missing or unresolvable contract / template / rubric / privacy ruleset references (§5.8).
+   - Tool-version retired from catalog.
+   - Schema-validation failures at registry write OR run dispatch.
 
-2. `Workspace Failures`
-   - Workspace directory creation failure
-   - Workspace population/synchronization failure (implementation-defined; can come from hooks)
-   - Invalid workspace path configuration
-   - Hook timeout/failure
+2. **Match-ticket store failures.**
+   - Schema unexpected, principal data unauthorized, concurrent run claimed, state-transition conflict, transport failure (§11.4).
 
-3. `Agent Session Failures`
-   - Startup handshake failure
-   - Turn failed/cancelled
-   - Turn timeout
-   - User input requested and handled as failure by the implementation's documented policy
-   - Subprocess exit
-   - Stalled session (no activity)
+3. **Gateway and model failures.**
+   - Gateway unreachable, authentication failed, provider rate-limited, provider response invalid (§10.6).
 
-4. `Tracker Failures`
-   - API transport errors
-   - Non-200 status
-   - GraphQL errors
-   - malformed payloads
+4. **Tool dispatch failures.**
+   - Unsupported tool, input-invalid, output-invalid, output-after-retry exhaustion, dispatch unavailable.
 
-5. `Observability Failures`
-   - Snapshot timeout
-   - Dashboard render errors
-   - Log sink configuration failure
+5. **Privacy filter failures.**
+   - Filter exhaustion (transient), ruleset-version unresolvable, projection schema invalid.
+
+6. **Audit and persistence failures.**
+   - Audit write retry exhausted, chain divergence, orphan reference, step divergence (§13.4).
+
+7. **Coordinator and step-execution failures.**
+   - Inngest step-level failures, total-run-timeout, tool-failure-beyond-retry, match-ticket invalidation.
 
 ### 14.2 Recovery Behavior
 
-- Dispatch validation failures:
-  - Skip new dispatches.
-  - Keep service alive.
-  - Continue reconciliation where possible.
+- **Registry resolution failures at dispatch:** reject the dispatch with an audit entry; the match ticket remains eligible for a later dispatch once the registry issue is resolved. No automatic retry.
+- **Match-ticket store transient failures:** retry per the step-level retry budget (§8.4); on exhaustion terminate the run with `tool_failure`.
+- **Gateway/model transient failures:** retry per `gateway_call_max_retries` with provider-supplied `retry-after` honored; on exhaustion either fall back per `gateway.fallback_policy` (§6.4) or terminate the turn and let the coordinator escalate.
+- **Tool dispatch failures:** structured failure returned to the model (§10.3); the run continues. Repeated failures beyond `tool_call_max_retries` for a single tool invocation surface as `tool_failure_event:beyond_retry` (§7.3).
+- **Privacy filter transient failures:** retry the filter step; on exhaustion the run terminates with `tool_failure` and a flag of kind `privacy_filter_unavailable` on any best-effort dossier.
+- **Audit failures:** treated as critical. Audit-write retry exhausted → terminate the run with `tool_failure` rather than continuing without durable audit. Chain divergence → real-time operator alert (§13.4) AND record the divergence as itself a `harness_event` audit entry.
+- **Coordinator failures (Inngest step crash, restart):** Inngest's durable execution resumes the function from its last persisted step. The coordinator's audit-log replay validation (§8.5C) MUST detect divergence; on divergence terminate the run with `tool_failure`.
 
-- Worker failures:
-  - Convert to retries with exponential backoff.
-
-- Tracker candidate-fetch failures:
-  - Skip this tick.
-  - Try again on next tick.
-
-- Reconciliation state-refresh failures:
-  - Keep current workers.
-  - Retry on next tick.
-
-- Dashboard/log failures:
-  - Do not crash the orchestrator.
+The harness has no run-level retry. Re-running a failed match ticket is always an explicit `match_ticket.renegotiation_requested` event with a new `run_id`.
 
 ### 14.3 Partial State Recovery (Restart)
 
-Current design is intentionally in-memory for scheduler state.
-Restart recovery means the service can resume useful operation by polling tracker state and reusing
-preserved workspaces. It does not mean retry timers, running sessions, or live worker state survive
-process restart.
+Inngest provides durable function execution; harness-level recovery is layered on top.
 
 After restart:
 
-- No retry timers are restored from prior process memory.
-- No running sessions are assumed recoverable.
-- Service recovers by:
-  - startup terminal workspace cleanup
-  - fresh polling of active issues
-  - re-dispatching eligible work
+- In-flight runs whose Inngest records are intact resume from the last persisted step.
+- Runs whose Inngest records are orphaned (deleted by Inngest retention or never persisted) are detected at startup reconciliation (§8.6) and marked `tool_failure` with reason `orphaned_inflight_run`.
+- Runs that produced and persisted a dossier but failed to emit `dossier.produced` are detected at startup and the event is re-emitted (§8.6).
+- The harness MUST NOT assume in-memory state survives restart. Coordinators rebuild their working view from the audit log + match-ticket state on resume.
+
+Per-run frozen versions:
+
+- A run dispatched under harness version A is not invalidated when the deployment moves to harness version B. The harness MAY emit a `harness_version_drift` warning audit entry on resume. Operationally critical changes that cannot tolerate drift MUST be implemented as a hard cutover with no in-flight runs at deploy time.
 
 ### 14.4 Operator Intervention Points
 
-Operators can control behavior by:
+Operators MAY influence harness behavior through these explicit, audited paths:
 
-- Editing `WORKFLOW.md` (prompt and most runtime settings).
-- `WORKFLOW.md` changes are detected and re-applied automatically without restart according to
-  Section 6.2.
-- Changing issue states in the tracker:
-  - terminal state -> running session is stopped and workspace cleaned when reconciled
-  - non-active state -> running session is stopped without cleanup
-- Restarting the service for process recovery or deployment (not as the normal path for applying
-  workflow config changes).
+- **Re-negotiation request.** Emit `match_ticket.renegotiation_requested` (§8.1) — produces a new `run_id` with a fresh dossier.
+- **Force termination.** Operator API call (§13.8) that records an `operator_action` audit entry and emits a synthetic `match_ticket.invalidating_state_change` event scoped to the run. The run terminates as `aborted`.
+- **Registry version updates.** New contract / rubric / privacy-ruleset versions are written to their registries; in-flight runs are not affected (frozen on dispatch). Future dispatches use the latest unless a specific version is pinned.
+- **Deployment rollout.** Harness redeploys are operator-controlled. Operators MAY drain to no in-flight runs before deploy if they need clean cutover; otherwise drift behavior in §14.3 applies.
 
-## 15. Security and Operational Safety
+Operators MUST NOT modify match-ticket state directly to influence in-flight runs; that path bypasses audit and is a configuration defect to expose.
 
-### 15.1 Trust Boundary Assumption
+## 15. Security, Privacy, and Regulatory Posture
 
-Each implementation defines its own trust boundary.
+The harness operates on protected employment-decision data and produces artifacts subject to AI-hiring regulation. Security and privacy are correctness requirements, not a hardening overlay. This section codifies the threat model, the privacy-filter posture, secret handling, and the regulatory hooks the harness MUST honor.
 
-Operational safety requirements:
+### 15.1 Threat Model
 
-- Implementations SHOULD state clearly whether they are intended for trusted environments, more
-  restrictive environments, or both.
-- Implementations SHOULD state clearly whether they rely on auto-approved actions, operator
-  approvals, stricter sandboxing, or some combination of those controls.
-- Workspace isolation and path validation are important baseline controls, but they are not a
-  substitute for whatever approval and sandbox policy an implementation chooses.
+The harness's primary adversaries are not external attackers; they are untrusted free-text and adversarial principals operating through legitimate channels.
 
-### 15.2 Filesystem Safety Requirements
+Assumed-untrusted inputs (§12.4 wrapping mandatory):
 
-Mandatory:
+- Seeker-supplied resume content and free-text profile fields.
+- Employer-supplied JD, role description, and free-text req fields.
+- ATS-imported job descriptions and candidate notes (via inbound integration).
+- Tool-returned free-text fragments crossing the privacy filter.
+- A2A-received content from external negotiation peers (when A2A is enabled).
 
-- Workspace path MUST remain under configured workspace root.
-- Coding-agent cwd MUST be the per-issue workspace path for the current run.
-- Workspace directory names MUST use sanitized identifiers.
+Threats this section defends against:
 
-RECOMMENDED additional hardening for ports:
+- **Prompt-injection from one principal aimed at the counterparty's agent.** Defended by the privacy filter (§3.1, §15.2), the untrusted-input wrapping convention (§12.4), and the run-to-completion discipline (no human-input dependencies the injection could exploit).
+- **Cross-match prompt-injection via the same principal's agent on multiple match tickets.** Defended by per-run isolation invariants (§9.5).
+- **Disclosure of principal data outside the privacy ruleset's stage rules.** Defended by the deterministic privacy filter (§15.2) and the field-level access boundary on `read_principal_data` (§11.1.2).
+- **Tampering with dossier outcomes.** Defended by dossier signing in production posture (§15.4) and the audit log's hash chain (§13.1).
+- **Replay or substitution of audit entries.** Defended by chain integrity and content addressing (§13.1, §13.3).
 
-- Run under a dedicated OS user.
-- Restrict workspace root permissions.
-- Mount workspace root on a dedicated volume if possible.
+Threats this section explicitly does NOT defend against:
+
+- Compromise of the harness deployment infrastructure (Vercel, Inngest, Postgres). These rely on the underlying platforms' controls; in scope for the deployment posture document, not the harness spec.
+- Model provider compromise (Anthropic, OpenAI). The harness MAY mitigate by recording the provider/model on every dossier, but cannot defend against a compromised model itself.
+- Determined operators with audit-erase capability. Tamper-evidence is the goal; tamper-prevention against an internal adversary with database admin rights is out of scope.
+
+### 15.2 Privacy Filter Posture
+
+The privacy filter is a deterministic rule-application engine, not a model-mediated component. This is a deliberate architectural choice motivated by audit-reconstructability: every projection MUST be replayable byte-for-byte from the source content + ruleset version + disclosure stage.
+
+Required properties:
+
+- **Deterministic.** No model invocation inside the filter. Implementation MAY use regex, schema-driven redaction, structured-field projection, or compiled rule evaluators.
+- **Versioned.** Each filter projection records the ruleset version applied. Replay against the same ruleset version MUST produce the same projection.
+- **Stage-aware.** The active disclosure stage (per §4.1.7) determines which rules are relaxed. The harness MUST record the stage on every projection audit entry.
+- **Untrusted-input-sanitizing.** Free-text fields are sanitized per the ruleset's `untrusted_input_policy` before being added to either side's view. Sanitization includes (at minimum) length capping per `privacy.untrusted_input_max_chars` (§6.4), control-character stripping, and any pattern-based redactions the ruleset specifies. Sentinel-injection attempts (attempts to forge `<<<UNTRUSTED_END>>>` strings) MUST be neutralized; the per-run nonce in the wrapping convention (§12.4) is the structural defense.
+- **Failing closed.** When a rule cannot be resolved (e.g. ambiguous schema field), the filter MUST elect the more restrictive projection. A `filter_ambiguity` warning MAY be emitted to operators.
 
 ### 15.3 Secret Handling
 
-- Support `$VAR` indirection in workflow config.
-- Do not log API tokens or secret env values.
-- Validate presence of secrets without printing them.
+- All secret material (gateway API keys, Inngest signing keys, dossier signing keys, Postgres credentials) MUST be referenced via secret-store handles (§6.4); inline secret material in config is rejected at validation.
+- Secrets MUST NOT appear in audit entry payloads, operator log lines, or canonical transcript content.
+- Secret rotation is a deployment operation; rotated keys take effect on subsequent process starts. In-flight runs continue under the keys they were dispatched with — for signing keys, this means dossiers signed during a rotation window MAY use the prior key, and the audit entry records `signer_key_id`.
 
-### 15.4 Hook Script Safety
+### 15.4 Dossier Signing
 
-Workspace hooks are arbitrary shell scripts from `WORKFLOW.md`.
+When `dossier.signing_enabled` is true (§6.4 default in production), the dossier producer MUST sign every dossier before emission.
 
-Implications:
+Signing scope:
 
-- Hooks are fully trusted configuration.
-- Hooks run inside the workspace directory.
-- Hook output SHOULD be truncated in logs.
-- Hook timeouts are REQUIRED to avoid hanging the orchestrator.
+- The signature covers all dossier fields except the signature object itself.
+- The canonical serialization for signing MUST be deterministic (e.g. canonical JSON). Implementation-defined whether RFC 8785 or a schema-specific canonicalization is used.
+- The signature, signer key id, and timestamp are recorded on the dossier (§4.1.8) AND in the `dossier_produced` audit entry.
 
-### 15.5 Harness Hardening Guidance
+Verification:
 
-Running Codex agents against repositories, issue trackers, and other inputs that can contain
-sensitive data or externally-controlled content can be dangerous. A permissive deployment can lead
-to data leaks, destructive mutations, or full machine compromise if the agent is induced to execute
-harmful commands or use overly-powerful integrations.
+- Downstream consumers of `dossier.produced` SHOULD verify the signature before acting on the dossier.
+- The harness MUST expose a verification helper that consumers can use without depending on harness internals.
 
-Implementations SHOULD explicitly evaluate their own risk profile and harden the execution harness
-where appropriate. This specification intentionally does not mandate a single hardening posture, but
-implementations SHOULD NOT assume that tracker data, repository contents, prompt inputs, or tool
-arguments are fully trustworthy just because they originate inside a normal workflow.
+### 15.5 Regulatory Posture
 
-Possible hardening measures include:
+JobBobber's harness is an automated employment decision tool under several active regulatory regimes. The harness MUST support compliance posture, but specific regulatory determinations remain product/legal artifacts referenced from the harness, not encoded into it.
 
-- Tightening Codex approval and sandbox settings described elsewhere in this specification instead
-  of running with a maximally permissive configuration.
-- Adding external isolation layers such as OS/container/VM sandboxing, network restrictions, or
-  separate credentials beyond the built-in Codex policy controls.
-- Filtering which Linear issues, projects, teams, labels, or other tracker sources are eligible for
-  dispatch so untrusted or out-of-scope tasks do not automatically reach the agent.
-- Narrowing the `linear_graphql` tool so it can only read or mutate data inside the
-  intended project scope, rather than exposing general workspace-wide tracker access.
-- Reducing the set of client-side tools, credentials, filesystem paths, and network destinations
-  available to the agent to the minimum needed for the workflow.
+Required regulatory hooks:
 
-The correct controls are deployment-specific, but implementations SHOULD document them clearly and
-treat harness hardening as part of the core safety model rather than an optional afterthought.
+- **Bias-test gating.** Production posture MUST refuse to dispatch a run whose rubric reference lacks a `bias_test_ref` (§5.4). The bias-test artifact's content and methodology are out of scope for this spec; the dispatch-time reference check is normative.
+- **Audit reconstruction.** The audit log + canonical transcript store MUST support full reconstruction of any past run's decision, including the specific rubric version, prompt template, model, and resolved per-dimension scores. NYC Local Law 144 audit and EEOC investigation both require this surface.
+- **Auditor access.** The operator API (§13.8) MUST support an auditor role with read-only access to audit entries and (under access-control review) the canonical transcript store. Auditor reads MUST themselves be audited.
+- **Retention.** `audit.retention_class` (§6.4) and the canonical transcript store's retention policy MUST be set to the longer of the regulatory requirement or the deployment's internal policy. Under-retention is a compliance defect.
+
+Hooks the harness does NOT itself implement:
+
+- Public-disclosure obligations under Local Law 144 (the bias-audit summary publication). Out of scope.
+- Candidate notification of automated decision use. Driven by JobBobber product UI consuming `dossier.produced`.
+- Worker-facing data-subject-access requests. Handled by the JobBobber data-subject-access subsystem reading from the audit log + canonical transcript store.
+
+### 15.6 Hardening Beyond the Spec
+
+Implementations SHOULD layer additional controls beyond the normative requirements:
+
+- Network egress restrictions on the harness deployment so the only outbound destinations are the gateway, Postgres, and Inngest.
+- Per-side gateway quotas to bound the blast radius of a runaway side runner.
+- Read-only replica enforcement for non-transactional reads (§11.2) so a buggy code path cannot accidentally write through a read connection.
+- Secrets-manager rotation policies aligned with the harness deployment cadence.
+- Automated bias-test re-execution on rubric version proposals before they're admitted to the registry.
+
+These are deployment posture decisions; the harness spec does not mandate them but RECOMMENDS them in production.
 
 ## 16. Reference Algorithms (Language-Agnostic)
 
-### 16.1 Service Startup
+These algorithms describe normative behavior. Implementations are free to refactor, parallelize, or specialize as long as observable behavior matches. The pseudocode targets the Inngest step-function model — calls of the form `step.run(name, fn)` denote durable, idempotent step boundaries that produce audit entries.
+
+### 16.1 Harness Process Startup
 
 ```text
-function start_service():
-  configure_logging()
-  start_observability_outputs()
-  start_workflow_watch(on_change=reload_and_reapply_workflow)
+function start_harness_process():
+  config = load_harness_config()
+  validate_harness_config(config)  // §6.3 startup validation
+  emit_audit_entry("harness_event:harness_config_loaded", {
+    harness_version: config.harness.version,
+    environment: config.harness.environment,
+    config_hash: hash(config)
+  })
 
-  state = {
-    poll_interval_ms: get_config_poll_interval_ms(),
-    max_concurrent_agents: get_config_max_concurrent_agents(),
-    running: {},
-    claimed: set(),
-    retry_attempts: {},
-    completed: set(),
-    codex_totals: {input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
-    codex_rate_limits: null
-  }
+  reconcile_persisted_but_unemitted_dossiers()  // §8.6
+  mark_orphaned_inflight_runs_as_tool_failure()  // §8.6
 
-  validation = validate_dispatch_config()
-  if validation is not ok:
-    log_validation_error(validation)
-    fail_startup(validation)
+  register_inngest_functions([
+    dispatcher, coordinator,
+    side_runner_seeker, side_runner_employer,
+    privacy_filter, dossier_producer,
+    run_invalidator
+  ])
 
-  startup_terminal_workspace_cleanup()
-  schedule_tick(delay_ms=0)
-
-  event_loop(state)
+  // Inngest takes over from here; the process is now event-driven.
 ```
 
-### 16.2 Poll-and-Dispatch Tick
+### 16.2 Dispatcher Function
 
 ```text
-on_tick(state):
-  state = reconcile_running_issues(state)
+function dispatcher(event):
+  // Triggered by match_ticket.match_made or match_ticket.renegotiation_requested
+  match_ticket_id = event.payload.match_ticket_id
 
-  validation = validate_dispatch_config()
-  if validation is not ok:
-    log_validation_error(validation)
-    notify_observers()
-    schedule_tick(state.poll_interval_ms)
-    return state
-
-  issues = tracker.fetch_candidate_issues()
-  if issues failed:
-    log_tracker_error()
-    notify_observers()
-    schedule_tick(state.poll_interval_ms)
-    return state
-
-  for issue in sort_for_dispatch(issues):
-    if no_available_slots(state):
-      break
-
-    if should_dispatch(issue, state):
-      state = dispatch_issue(issue, state, attempt=null)
-
-  notify_observers()
-  schedule_tick(state.poll_interval_ms)
-  return state
-```
-
-### 16.3 Reconcile Active Runs
-
-```text
-function reconcile_running_issues(state):
-  state = reconcile_stalled_runs(state)
-
-  running_ids = keys(state.running)
-  if running_ids is empty:
-    return state
-
-  refreshed = tracker.fetch_issue_states_by_ids(running_ids)
-  if refreshed failed:
-    log_debug("keep workers running")
-    return state
-
-  for issue in refreshed:
-    if issue.state in terminal_states:
-      state = terminate_running_issue(state, issue.id, cleanup_workspace=true)
-    else if issue.state in active_states:
-      state.running[issue.id].issue = issue
-    else:
-      state = terminate_running_issue(state, issue.id, cleanup_workspace=false)
-
-  return state
-```
-
-### 16.4 Dispatch One Issue
-
-```text
-function dispatch_issue(issue, state, attempt):
-  worker = spawn_worker(
-    fn -> run_agent_attempt(issue, attempt, parent_orchestrator_pid) end
+  step.run("preflight_validation", fn ->
+    match_ticket = match_ticket_store.read(match_ticket_id)
+    require_resolves(match_ticket.seeker_contract_ref)
+    require_resolves(match_ticket.employer_contract_ref)
+    require_resolves(match_ticket.privacy_ruleset_ref)
+    require_bias_test(match_ticket.seeker_contract_ref.rubric_ref)
+    require_bias_test(match_ticket.employer_contract_ref.rubric_ref)
+    return match_ticket
   )
 
-  if worker spawn failed:
-    return schedule_retry(state, issue.id, next_attempt(attempt), {
-      identifier: issue.identifier,
-      error: "failed to spawn agent"
+  run_id = step.run("claim_run", fn ->
+    new_run_id = uuid()
+    match_ticket_store.claim_run(match_ticket_id, new_run_id)  // §11.1.3
+    return new_run_id
+  )
+
+  step.run("audit_run_dispatched", fn ->
+    emit_audit_entry("run_dispatched", {
+      run_id, match_ticket_id, attempt: derive_attempt_number(event),
+      seeker_contract_ref: match_ticket.seeker_contract_ref,
+      employer_contract_ref: match_ticket.employer_contract_ref,
+      privacy_ruleset_ref: match_ticket.privacy_ruleset_ref,
+      dispatched_by_event: event.name
     })
+  )
 
-  state.running[issue.id] = {
-    worker_handle,
-    monitor_handle,
-    identifier: issue.identifier,
-    issue,
-    session_id: null,
-    codex_app_server_pid: null,
-    last_codex_message: null,
-    last_codex_event: null,
-    last_codex_timestamp: null,
-    codex_input_tokens: 0,
-    codex_output_tokens: 0,
-    codex_total_tokens: 0,
-    last_reported_input_tokens: 0,
-    last_reported_output_tokens: 0,
-    last_reported_total_tokens: 0,
-    retry_attempt: normalize_attempt(attempt),
-    started_at: now_utc()
-  }
-
-  state.claimed.add(issue.id)
-  state.retry_attempts.remove(issue.id)
-  return state
+  inngest.send("negotiation.dispatch.requested", {
+    run_id, match_ticket_id
+  })
 ```
 
-### 16.5 Worker Attempt (Workspace + Prompt + Agent)
+### 16.3 Coordinator Function
 
 ```text
-function run_agent_attempt(issue, attempt, orchestrator_channel):
-  workspace = workspace_manager.create_for_issue(issue.identifier)
-  if workspace failed:
-    fail_worker("workspace error")
+function coordinator(event):
+  run_id = event.payload.run_id
+  match_ticket_id = event.payload.match_ticket_id
 
-  if run_hook("before_run", workspace.path) failed:
-    fail_worker("before_run hook error")
+  step.run("resolve_contracts", fn ->
+    seeker = contract_loader.resolve(seeker_contract_ref)
+    employer = contract_loader.resolve(employer_contract_ref)
+    apply_runtime_ceilings(seeker, employer)  // §5.6 clamping
+    audit("contract_resolved", { run_id, side: "seeker", ... })
+    audit("contract_resolved", { run_id, side: "employer", ... })
+    return { seeker, employer }
+  )
 
-  session = app_server.start_session(workspace=workspace.path)
-  if session failed:
-    run_hook_best_effort("after_run", workspace.path)
-    fail_worker("agent session startup error")
+  round_cap = min(seeker.round_cap_contribution,
+                  employer.round_cap_contribution,
+                  config.runs.default_round_cap)
 
-  max_turns = config.agent.max_turns
-  turn_number = 1
+  for round in 1..round_cap:
+    if invalidating_change_observed(match_ticket_id, run_id):
+      transition(run_id, current_state, "aborted", "match_state_change")
+      return
 
-  while true:
-    prompt = build_turn_prompt(workflow_template, issue, attempt, turn_number, max_turns)
-    if prompt failed:
-      app_server.stop_session(session)
-      run_hook_best_effort("after_run", workspace.path)
-      fail_worker("prompt error")
+    transition(run_id, prior_state, "seeker_turn", "round_start")
+    inngest.send("negotiation.turn.requested", { run_id, side: "seeker", round })
+    seeker_result = step.waitForEvent("negotiation.turn.completed",
+                                      filter: { run_id, side: "seeker", round },
+                                      timeout: total_run_timeout_remaining())
 
-    turn_result = app_server.run_turn(
-      session=session,
-      prompt=prompt,
-      issue=issue,
-      on_message=(msg) -> send(orchestrator_channel, {codex_update, issue.id, msg})
+    transition(run_id, "seeker_turn", "seeker_filtering", "turn_completed")
+    inngest.send("negotiation.filter.requested", {
+      run_id, direction: "seeker_to_employer", source: seeker_result
+    })
+    step.waitForEvent("negotiation.filter.completed",
+                     filter: { run_id, direction: "seeker_to_employer", round })
+
+    transition(run_id, "seeker_filtering", "employer_turn", "filter_complete")
+    inngest.send("negotiation.turn.requested", { run_id, side: "employer", round })
+    employer_result = step.waitForEvent("negotiation.turn.completed",
+                                        filter: { run_id, side: "employer", round },
+                                        timeout: total_run_timeout_remaining())
+
+    transition(run_id, "employer_turn", "employer_filtering", "turn_completed")
+    inngest.send("negotiation.filter.requested", {
+      run_id, direction: "employer_to_seeker", source: employer_result
+    })
+    step.waitForEvent("negotiation.filter.completed",
+                     filter: { run_id, direction: "employer_to_seeker", round })
+
+    transition(run_id, "employer_filtering", "round_complete", "round_done")
+
+    if both_signaled_done(seeker_result, employer_result) or round == round_cap:
+      transition(run_id, "round_complete", "scoring", "proceed_to_scoring")
+      break
+    else:
+      transition(run_id, "round_complete", "seeker_turn", "advance_round")
+
+  inngest.send("negotiation.scoring.requested", { run_id, side: "seeker" })
+  inngest.send("negotiation.scoring.requested", { run_id, side: "employer" })
+  seeker_scores = step.waitForEvent("negotiation.scoring.completed",
+                                    filter: { run_id, side: "seeker" })
+  employer_scores = step.waitForEvent("negotiation.scoring.completed",
+                                      filter: { run_id, side: "employer" })
+
+  transition(run_id, "scoring", "producing_dossier", "scoring_complete")
+  inngest.send("negotiation.dossier.requested", {
+    run_id, seeker_scores, employer_scores
+  })
+  dossier_id = step.waitForEvent("dossier_producer.completed",
+                                 filter: { run_id })
+
+  outcome = read_dossier_outcome(dossier_id)
+  terminal = outcome == "complete" ? "complete" : "inconclusive"
+  transition(run_id, "producing_dossier", terminal, "dossier_persisted")
+  inngest.send("negotiation.run.terminated", { run_id, terminal_state: terminal, dossier_id })
+  inngest.send("dossier.produced", { dossier_id, match_ticket_id })
+```
+
+### 16.4 Side Runner Function (Per-Side, Single Function Per Side)
+
+```text
+function side_runner(event):
+  // Triggered by negotiation.turn.requested or negotiation.scoring.requested
+  // event.payload.side identifies which side; the function is dispatched per side.
+  run_id = event.payload.run_id
+  side = event.payload.side
+  phase = event.name == "negotiation.scoring.requested" ? "scoring" : "negotiation"
+
+  context = step.run("resolve_context", fn ->
+    return context_manager.load(run_id, side)
+  )
+  contract = step.run("resolve_contract", fn ->
+    return contract_loader.resolve(context.contract_ref)
+  )
+
+  prompt = step.run("assemble_prompt", fn ->
+    return prompt_assembler.build(context, contract, phase, event.payload.round)
+  )
+
+  output = step.run("invoke_gateway", fn ->
+    return gateway.invoke_with_tools(
+      prompt: prompt,
+      model: contract.model,
+      tool_surface: contract.tool_surface,
+      runtime_settings: contract.runtime_settings,
+      tool_dispatcher: harness_tool_dispatcher  // §10.3
     )
+  )
 
-    if turn_result failed:
-      app_server.stop_session(session)
-      run_hook_best_effort("after_run", workspace.path)
-      fail_worker("agent turn error")
+  validated = step.run("validate_structured_output", fn ->
+    return validate_against_schema(output, phase)  // §10.4
+  )
 
-    refreshed_issue = tracker.fetch_issue_states_by_ids([issue.id])
-    if refreshed_issue failed:
-      app_server.stop_session(session)
-      run_hook_best_effort("after_run", workspace.path)
-      fail_worker("issue state refresh error")
+  step.run("audit_turn", fn ->
+    emit_audit_entry("state_transition", { ... })
+    emit_audit_entry("tool_call", ...) for each tool call
+  )
 
-    issue = refreshed_issue[0] or issue
-
-    if issue.state is not active:
-      break
-
-    if turn_number >= max_turns:
-      break
-
-    turn_number = turn_number + 1
-
-  app_server.stop_session(session)
-  run_hook_best_effort("after_run", workspace.path)
-
-  exit_normal()
-```
-
-### 16.6 Worker Exit and Retry Handling
-
-```text
-on_worker_exit(issue_id, reason, state):
-  running_entry = state.running.remove(issue_id)
-  state = add_runtime_seconds_to_totals(state, running_entry)
-
-  if reason == normal:
-    state.completed.add(issue_id)  # bookkeeping only
-    state = schedule_retry(state, issue_id, 1, {
-      identifier: running_entry.identifier,
-      delay_type: continuation
+  if phase == "negotiation":
+    inngest.send("negotiation.turn.completed", {
+      run_id, side, round: event.payload.round, output: validated
     })
   else:
-    state = schedule_retry(state, issue_id, next_attempt_from(running_entry), {
-      identifier: running_entry.identifier,
-      error: format("worker exited: %reason")
+    inngest.send("negotiation.scoring.completed", {
+      run_id, side, dimension_scores: validated.dimension_scores,
+      headline_rationale: validated.headline_rationale,
+      flag_proposals: validated.flag_proposals
     })
-
-  notify_observers()
-  return state
 ```
 
+### 16.5 Privacy Filter Function
+
 ```text
-on_retry_timer(issue_id, state):
-  retry_entry = state.retry_attempts.pop(issue_id)
-  if missing:
-    return state
+function privacy_filter(event):
+  run_id = event.payload.run_id
+  direction = event.payload.direction
+  source_content = event.payload.source
 
-  candidates = tracker.fetch_candidate_issues()
-  if fetch failed:
-    return schedule_retry(state, issue_id, retry_entry.attempt + 1, {
-      identifier: retry_entry.identifier,
-      error: "retry poll failed"
+  ruleset = step.run("resolve_ruleset", fn ->
+    return ruleset_loader.resolve(get_run_ruleset_ref(run_id))
+  )
+
+  current_stage = step.run("read_stage", fn ->
+    return read_disclosure_stage(run_id)
+  )
+
+  projection = step.run("apply_filter", fn ->
+    sanitized = sanitize_untrusted_input(source_content, ruleset.untrusted_input_policy)
+    redacted = apply_redaction_rules(sanitized, ruleset.redaction_rules, current_stage)
+    return redacted
+  )
+
+  transcript_ref = step.run("persist_unredacted_to_transcript_store", fn ->
+    return canonical_transcript_store.put(source_content)
+  )
+
+  step.run("audit_projection", fn ->
+    emit_audit_entry("cross_side_projection", {
+      run_id, direction,
+      ruleset_ref: ruleset.ref, disclosure_stage: current_stage,
+      source_hash: hash(source_content),
+      projected_hash: hash(projection),
+      transcript_canonical_ref: transcript_ref
     })
+  )
 
-  issue = find_by_id(candidates, issue_id)
-  if issue is null:
-    state.claimed.remove(issue_id)
-    return state
+  step.run("update_receiving_view", fn ->
+    receiving_side = direction.endswith("_to_seeker") ? "seeker" : "employer"
+    context_manager.append_counterparty_view(run_id, receiving_side, projection)
+  )
 
-  if available_slots(state) == 0:
-    return schedule_retry(state, issue_id, retry_entry.attempt + 1, {
-      identifier: issue.identifier,
-      error: "no available orchestrator slots"
+  inngest.send("negotiation.filter.completed", {
+    run_id, direction, projection_hash: hash(projection)
+  })
+```
+
+### 16.6 Dossier Producer Function
+
+```text
+function dossier_producer(event):
+  run_id = event.payload.run_id
+  seeker_scores = event.payload.seeker_scores
+  employer_scores = event.payload.employer_scores
+
+  outcome = step.run("determine_outcome", fn ->
+    if all_dimensions_scored(seeker_scores) and all_dimensions_scored(employer_scores):
+      return "complete"
+    return "inconclusive"
+  )
+
+  weighted = step.run("compute_weighted_totals", fn ->
+    seeker_rubric = resolve_rubric(get_seeker_rubric_ref(run_id))
+    employer_rubric = resolve_rubric(get_employer_rubric_ref(run_id))
+    return {
+      seeker_total: deterministic_weighted_mean(seeker_scores, seeker_rubric),
+      employer_total: deterministic_weighted_mean(employer_scores, employer_rubric)
+    }
+  )
+
+  projections = step.run("project_transcript_per_audience", fn ->
+    return {
+      seeker: project(canonical_transcript, audience: "seeker"),
+      employer: project(canonical_transcript, audience: "employer"),
+      auditor: project(canonical_transcript, audience: "auditor"),
+      a2a_receiver: project(canonical_transcript, audience: "a2a_receiver")
+    }
+  )
+
+  flags = step.run("reconcile_flags", fn ->
+    return dedupe(seeker_scores.flag_proposals + employer_scores.flag_proposals
+                  + auto_flags_from_outcome(outcome))
+  )
+
+  dossier = step.run("assemble_dossier", fn ->
+    return {
+      dossier_id: uuid(),
+      match_ticket_id, run_id,
+      version: next_dossier_version(match_ticket_id),
+      seeker_score: { dimensions: seeker_scores, weighted_total: weighted.seeker_total },
+      employer_score: { dimensions: employer_scores, weighted_total: weighted.employer_total },
+      transcript_canonical_ref, transcript_projections: projections,
+      agent_rationale: { seeker: seeker_scores.headline_rationale,
+                         employer: employer_scores.headline_rationale },
+      flags, outcome, version_metadata: collect_version_metadata(run_id),
+      produced_at: now_utc()
+    }
+  )
+
+  if config.dossier.signing_enabled:
+    dossier = step.run("sign_dossier", fn ->
+      return sign(dossier, key_ref: config.dossier.signing_key_ref)
+    )
+
+  step.run("persist_dossier", fn ->
+    dossier_store.put(dossier)
+    match_ticket_store.attach_dossier(match_ticket_id, run_id,
+                                      dossier.dossier_id, dossier.version)
+  )
+
+  step.run("audit_dossier_produced", fn ->
+    emit_audit_entry("dossier_produced", {
+      run_id, dossier_id: dossier.dossier_id, dossier_version: dossier.version,
+      outcome, signature_present: config.dossier.signing_enabled,
+      version_metadata_hash: hash(dossier.version_metadata)
     })
+  )
 
-  return dispatch_issue(issue, state, attempt=retry_entry.attempt)
+  inngest.send("dossier_producer.completed", { run_id, dossier_id: dossier.dossier_id })
+```
+
+### 16.7 Deterministic Weighted-Mean Aggregation
+
+```text
+function deterministic_weighted_mean(dimension_scores, rubric):
+  validate(dimension_scores.names == rubric.dimensions.names)
+  numerator = 0
+  for d in rubric.dimensions:
+    score = dimension_scores.find(d.name).score
+    numerator += score * d.weight
+  return numerator / rubric.weight_total
+```
+
+### 16.8 History Truncation Summary Generation
+
+```text
+function summarize_truncated_round(run_id, round, audit_entries):
+  // Deterministic, NO model call. §12.5.
+  seeker_msg = find_audit(audit_entries, kind: "cross_side_projection",
+                          direction: "seeker_to_employer", round: round)
+  employer_msg = find_audit(audit_entries, kind: "cross_side_projection",
+                            direction: "employer_to_seeker", round: round)
+  return {
+    round: round,
+    seeker_summary: extract_first_n_chars(seeker_msg.projected_excerpt, 200),
+    employer_summary: extract_first_n_chars(employer_msg.projected_excerpt, 200),
+    flag_proposals_seen: collect_flag_proposals_in_round(audit_entries, round)
+  }
 ```
 
 ## 17. Test and Validation Matrix
