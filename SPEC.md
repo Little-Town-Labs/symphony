@@ -1,8 +1,10 @@
-# Symphony Service Specification
+# JobBobber Agent Harness Specification
 
-Status: Draft v1 (language-agnostic)
+Status: Draft v1. Target runtime is TypeScript on Inngest / Next.js / Postgres (Vercel); the harness patterns described here are stack-agnostic, but normative requirements are written against that target.
 
-Purpose: Define a service that orchestrates coding agents to get project work done.
+Purpose: Define the harness that wraps each JobBobber match-ticket negotiation — the structured envelope around two autonomous agents that makes their joint output safe to launch, legible while running, verifiable when complete, and defensible under AI-hiring regulation.
+
+> This document is forked from the Symphony coding-agent specification (`openai/symphony`, commit `58cf97d`, Apache 2.0). Symphony's contribution is the harness pattern: versioned agent contract, sandboxed execution context, defined tool surface, untrusted-input posture, run-to-completion rule, and proof-of-work artifact. Those six elements are preserved here. Symphony's deployment choices — Linear as control plane, Codex App Server protocol, polling scheduler, Elixir runtime — are replaced with JobBobber's: first-class match tickets in Postgres, Anthropic/OpenAI via Vercel AI Gateway, Inngest event-driven execution. See [`JOBBOBBER_ADAPTATIONS.md`](JOBBOBBER_ADAPTATIONS.md) for the section-by-section reasoning.
 
 ## Normative Language
 
@@ -15,133 +17,135 @@ behavior.
 
 ## 1. Problem Statement
 
-Symphony is a long-running automation service that continuously reads work from an issue tracker
-(Linear in this specification version), creates an isolated workspace for each issue, and runs a
-coding agent session for that issue inside the workspace.
+The JobBobber harness is the runtime envelope around a single **match-ticket negotiation run**. When a seeker ticket and an employer ticket meet, a match ticket is created and two autonomous agents — one acting on behalf of each side's principal — conduct a structured negotiation through a privacy filter. Each agent independently scores the fit against its own versioned rubric. The harness wraps that joint execution and produces a **match dossier** as the proof-of-work artifact for human review and audit.
 
-The service solves four operational problems:
+The harness solves five operational problems:
 
-- It turns issue execution into a repeatable daemon workflow instead of manual scripts.
-- It isolates agent execution in per-issue workspaces so agent commands run only inside per-issue
-  workspace directories.
-- It keeps the workflow policy in-repo (`WORKFLOW.md`) so teams version the agent prompt and runtime
-  settings with their code.
-- It provides enough observability to operate and debug multiple concurrent agent runs.
+- It turns each match-ticket negotiation into a repeatable, durable workflow instead of an ad-hoc agent invocation, so behavior is reproducible and replayable.
+- It isolates per-match-ticket execution context so a manipulation embedded in one ticket's untrusted text cannot leak into another ticket's negotiation.
+- It mediates every cross-side communication through the privacy filter so each principal's data is exposed to the other side's agent only under the principal's filter rules.
+- It versions the agent contract — prompt template, scoring rubric, tool surface, model selection — and records the version on every dossier so any decision can be traced back to the exact configuration that produced it.
+- It produces an auditable record sufficient to defend automated employment decisions under EEOC, NYC Local Law 144, and similar AI-hiring regulation.
 
-Implementations are expected to document their trust and safety posture explicitly. This
-specification does not require a single approval, sandbox, or operator-confirmation policy; some
-implementations target trusted environments with a high-trust configuration, while others require
-stricter approvals or sandboxing.
+Implementations MUST document their trust and safety posture explicitly: the privacy-filter rule set, the rubric versioning policy, the prompt-injection threat model, and the bias-testing protocol applied to each rubric version.
 
-Important boundary:
+Important boundaries:
 
-- Symphony is a scheduler/runner and tracker reader.
-- Ticket writes (state transitions, comments, PR links) are typically performed by the coding agent
-  using tools available in the workflow/runtime environment.
-- A successful run can end at a workflow-defined handoff state (for example `Human Review`), not
-  necessarily `Done`.
+- The harness is a **negotiation runner and dossier producer**. It does not decide whether a match clears either side's notification threshold; that is a downstream consumer's policy applied to the dossier.
+- The harness does not write to the seeker's or employer's principal-side state directly. State transitions on the match ticket (round counters, completion, dossier attachment) are performed by the harness itself; downstream effects (notifications, ATS pushes, A2A emissions) are triggered by separate Inngest functions consuming the harness's emitted events.
+- A successful run ends with a complete dossier attached to the match ticket. A run that cannot produce a complete dossier (e.g. insufficient information, tool failure beyond retry) MUST end with an `inconclusive` dossier listing what would resolve it, not by pausing for human input mid-run.
 
 ## 2. Goals and Non-Goals
 
 ### 2.1 Goals
 
-- Poll the issue tracker on a fixed cadence and dispatch work with bounded concurrency.
-- Maintain a single authoritative orchestrator state for dispatch, retries, and reconciliation.
-- Create deterministic per-issue workspaces and preserve them across runs.
-- Stop active runs when issue state changes make them ineligible.
-- Recover from transient failures with exponential backoff.
-- Load runtime behavior from a repository-owned `WORKFLOW.md` contract.
-- Expose operator-visible observability (at minimum structured logs).
-- Support tracker/filesystem-driven restart recovery without requiring a persistent database; exact
-  in-memory scheduler state is not restored.
+- Execute one match-ticket negotiation as a single autonomous run, dispatched on the Inngest event-driven runtime with bounded concurrency.
+- Maintain per-run isolation: no shared state between match tickets, even when the same principal's agent is acting on multiple tickets concurrently.
+- Mediate every message exchanged between the two side agents through the privacy filter, applying that match ticket's filter rules deterministically.
+- Score each side's view of the match dimension-by-dimension against a versioned rubric, computing weighted totals deterministically rather than asking the model for a single holistic score.
+- Produce a versioned, structured match dossier on every completed run — scores with rubric breakdowns, redacted transcript projections per consumer, agent rationale, flags, and full version metadata (prompt, rubric, model, harness).
+- Persist the audit trail (dossier, prompt version, rubric version, model identifiers, redacted transcript) durably; auditability is a primary correctness requirement, not an observability nice-to-have.
+- Enforce a hard cap on negotiation rounds per match ticket; runs that hit the cap conclude with whatever dossier the agents have produced to that point.
+- Treat run-to-completion as the harness contract: agents MUST NOT block waiting for human input mid-negotiation. Inability to score MUST surface as a flagged dossier, not a paused run.
+- Support graceful tool-surface extension: new tools MAY be added to the agent contract without breaking older active runs; unsupported tool calls return structured failure without crashing the run.
 
 ### 2.2 Non-Goals
 
-- Rich web UI or multi-tenant control plane.
-- Prescribing a specific dashboard or terminal UI implementation.
-- General-purpose workflow engine or distributed job scheduler.
-- Built-in business logic for how to edit tickets, PRs, or comments. (That logic lives in the
-  workflow prompt and agent tooling.)
-- Mandating strong sandbox controls beyond what the coding agent and host OS provide.
-- Mandating a single default approval, sandbox, or operator-confirmation posture for all
-  implementations.
+- A general-purpose multi-agent orchestration framework. The harness is shaped specifically for two-sided negotiation between privacy-filtered principal agents.
+- A custom durable workflow engine. Inngest provides retry, supervision, and durable execution; the harness composes Inngest functions rather than reimplementing those primitives.
+- Defining rubric content. The harness defines the rubric **structure** (versioned dimensions, weights, scoring guidance, anchor examples) and the deterministic scoring computation; the actual dimension content and bias-testing of specific rubric versions live in product/policy artifacts referenced by the harness.
+- Defining the human-review UI. The dossier schema is the contract; the seeker and employer review surfaces consume the dossier and are out of scope here.
+- A multi-tenant control plane. JobBobber is one product, one harness deployment.
+- Approving or denying matches. The harness produces the dossier; threshold checks and routing decisions are downstream consumers' responsibility.
+- The ATS, A2A, and notification deliveries themselves. Those are separate Inngest functions consuming the harness's `dossier.produced` event.
 
 ## 3. System Overview
 
 ### 3.1 Main Components
 
-1. `Workflow Loader`
-   - Reads `WORKFLOW.md`.
-   - Parses YAML front matter and prompt body.
-   - Returns `{config, prompt_template}`.
+1. `Agent Contract Loader`
+   - Loads the versioned **agent contract** for a given side: prompt template, scoring rubric reference, tool surface, model selection, round cap, timeout settings.
+   - Resolves the contract at run start and freezes it for the duration of the run; the same contract version applies to every step of one run.
+   - Returns `{contract_version, prompt_template, rubric_ref, tool_surface, model, runtime_settings}`.
 
 2. `Config Layer`
-   - Exposes typed getters for workflow config values.
-   - Applies defaults and environment variable indirection.
-   - Performs validation used by the orchestrator before dispatch.
+   - Exposes typed getters for harness-wide config (Inngest function settings, gateway endpoints, model fallback policy, concurrency caps, timeouts, redaction policy version).
+   - Applies defaults and environment-variable indirection.
+   - Performs validation used by the negotiation coordinator before dispatch.
 
-3. `Issue Tracker Client`
-   - Fetches candidate issues in active states.
-   - Fetches current states for specific issue IDs (reconciliation).
-   - Fetches terminal-state issues during startup cleanup.
-   - Normalizes tracker payloads into a stable issue model.
+3. `Match Ticket Reader`
+   - Reads the match ticket and both sides' principal data from JobBobber's Postgres store.
+   - Returns the negotiation-ready ticket model: both sides' filtered profile views, comp ranges, role/intent metadata, the agent contract pointer for each side, and the privacy-filter rule set the principals have configured.
+   - Normalizes ticket payloads into the stable model defined in §4.
 
-4. `Orchestrator`
-   - Owns the poll tick.
-   - Owns the in-memory runtime state.
-   - Decides which issues to dispatch, retry, stop, or release.
-   - Tracks session metrics and retry queue state.
+4. `Negotiation Coordinator`
+   - Owns the lifecycle of one match-ticket negotiation run.
+   - Decides round sequencing, dispatches each side's agent turn, enforces the round cap, and concludes the run.
+   - Owns the run-state machine (§7) and transitions it on agent events, tool failures, timeouts, and round-cap reached.
 
-5. `Workspace Manager`
-   - Maps issue identifiers to workspace paths.
-   - Ensures per-issue workspace directories exist.
-   - Runs workspace lifecycle hooks.
-   - Cleans workspaces for terminal issues.
+5. `Negotiation Context Manager`
+   - Creates and owns the per-run context: each side's prompt history, working memory, tool-call log, and rubric scratch state.
+   - Guarantees isolation: contexts MUST NOT share state across match tickets, even when the same principal's agent is running on multiple tickets concurrently. This is the prompt-injection containment boundary.
+   - Cleans context at run completion; persistence is via the dossier and audit log, not the context itself.
 
-6. `Agent Runner`
-   - Creates workspace.
-   - Builds prompt from issue + workflow template.
-   - Launches the coding agent app-server client.
-   - Streams agent updates back to the orchestrator.
+6. `Privacy Filter`
+   - Mediates every cross-side message exchange.
+   - Applies the match ticket's filter rules deterministically: redacts identifying fields the principal has not authorized to share at this stage, sanitizes untrusted free-text against the prompt-injection posture (§15), and enforces visibility constraints on tool-returned content.
+   - Emits a redacted projection of every exchange to the audit log.
 
-7. `Status Surface` (OPTIONAL)
-   - Presents human-readable runtime status (for example terminal output, dashboard, or other
-     operator-facing view).
+7. `Side Agent Runner`
+   - One per side per run (seeker-side, employer-side).
+   - Composes the run prompt from the match ticket + agent contract + accumulated context.
+   - Drives the model session via the configured gateway, exchanges messages through the privacy filter, invokes tools from the contract's tool surface, and produces per-dimension rubric scores at run conclusion.
+   - Streams agent events back to the negotiation coordinator.
 
-8. `Logging`
-   - Emits structured runtime logs to one or more configured sinks.
+8. `Dossier Producer`
+   - At run completion, assembles the **match dossier** from both sides' scored output: per-dimension scores with rubric breakdowns, deterministic weighted totals, the redacted transcript projection per consumer audience, each agent's one-paragraph rationale, surfaced flags, and full version metadata.
+   - Writes the dossier durably to the match ticket and emits a `dossier.produced` event.
+
+9. `Audit Log`
+   - Append-only durable record of every harness decision: run dispatch, contract version resolved, every privacy-filter projection, every tool call and result, every state transition, and the final dossier reference.
+   - Compliance-grade: tamper-evident, retained per the regulatory schedule, and queryable for audit reconstruction.
+
+10. `Status Surface` (OPTIONAL)
+    - Operator-visible runtime view for active runs and recent dossier outcomes. Implementation-defined; the harness contract does not require a specific UI.
 
 ### 3.2 Abstraction Levels
 
-Symphony is easiest to port when kept in these layers:
+The harness is easiest to evolve when kept in these layers:
 
-1. `Policy Layer` (repo-defined)
-   - `WORKFLOW.md` prompt body.
-   - Team-specific rules for ticket handling, validation, and handoff.
+1. `Policy Layer` (versioned data)
+   - Per-side prompt templates, scoring rubrics, redaction rule sets.
+   - Versioned in code or in a versioned data store; each version is referenced from the run's agent contract.
 
 2. `Configuration Layer` (typed getters)
-   - Parses front matter into typed runtime settings.
-   - Handles defaults, environment tokens, and path normalization.
+   - Parses harness config into typed runtime settings.
+   - Handles defaults, environment-variable resolution, and gateway endpoint selection.
 
-3. `Coordination Layer` (orchestrator)
-   - Polling loop, issue eligibility, concurrency, retries, reconciliation.
+3. `Coordination Layer` (negotiation coordinator)
+   - Run-state machine, round sequencing, concurrency, retries, run termination.
 
-4. `Execution Layer` (workspace + agent subprocess)
-   - Filesystem lifecycle, workspace preparation, coding-agent protocol.
+4. `Execution Layer` (side agent runners + negotiation context manager)
+   - Model session lifecycle, prompt assembly, tool dispatch, per-side context isolation.
 
-5. `Integration Layer` (Linear adapter)
-   - API calls and normalization for tracker data.
+5. `Mediation Layer` (privacy filter)
+   - The deterministic boundary every cross-side message crosses; the choke point for the untrusted-input posture.
 
-6. `Observability Layer` (logs + OPTIONAL status surface)
-   - Operator visibility into orchestrator and agent behavior.
+6. `Integration Layer` (match ticket reader)
+   - Reads from JobBobber's Postgres match-ticket store; writes the dossier and run state back.
+
+7. `Observability Layer` (audit log + structured logs + OPTIONAL status surface)
+   - Compliance-grade audit on the durable side; operator visibility on the volatile side.
 
 ### 3.3 External Dependencies
 
-- Issue tracker API (Linear for `tracker.kind: linear` in this specification version).
-- Local filesystem for workspaces and logs.
-- OPTIONAL workspace population tooling (for example Git CLI, if used).
-- Coding-agent executable that supports the targeted Codex app-server mode.
-- Host environment authentication for the issue tracker and coding agent.
+- JobBobber Postgres — match ticket store, principal data, rubric and prompt version registry, audit log persistence.
+- Inngest — durable workflow execution, retries, concurrency control, supervision. The harness composes Inngest functions; it does not reimplement durable execution.
+- Vercel AI Gateway — model access for Anthropic and OpenAI side agents. Implementation-defined which model family is selected per side per contract version.
+- Internal tRPC tool endpoints — JobBobber platform tools the agents may invoke (profile lookup, comp data, etc.) under the contract's tool surface (§10).
+- Host environment authentication for Postgres, Inngest signing keys, and gateway API keys.
+
+Downstream consumers of the `dossier.produced` event (notification service, ATS webhook emitter, A2A receiver) are NOT dependencies of the harness; they consume the harness's output without the harness needing to know about them.
 
 ## 4. Core Domain Model
 
